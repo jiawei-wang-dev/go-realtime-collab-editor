@@ -1,0 +1,19 @@
+# macOS and archive metadata
+.DS_Store
+**/.DS_Store
+__MACOSX/
+*.zip
+
+# Go build and test artifacts
+/bin/
+/dist/
+*.test
+coverage.out
+*.prof
+
+# IDE and editor files
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
