@@ -627,16 +627,59 @@ version = 3
 
 ### Demo 3 — Read-only 拦截
 
-以 `user-c` 加入后发送：
+`user-c` 已在前面的 REST 初始化步骤中被设置为 `read` 权限。
 
-```json
-{"type":"edit","request_id":"demo-3","doc_id":"main.go","base_version":3,"operation":{"kind":"insert","position":0,"text":"blocked"}}
+新开一个 Terminal C，建立 WebSocket 连接：
+
+```bash
+websocat 'ws://localhost:8080/ws?doc_id=main.go&user_id=user-c'
 ```
 
-返回：
+发送 Join 消息：
 
-```text
-PERMISSION_DENIED
+```json
+{
+  "type": "join",
+  "doc_id": "main.go"
+}
+```
+
+预期收到当前文档状态，并确认 `role=read`：
+
+```json
+{
+  "type": "joined",
+  "doc_id": "main.go",
+  "version": 3,
+  "content": "ABabXcdef",
+  "role": "read"
+}
+```
+
+然后发送 Edit 消息：
+
+```json
+{
+  "type": "edit",
+  "request_id": "demo-3",
+  "doc_id": "main.go",
+  "base_version": 3,
+  "operation": {
+    "kind": "insert",
+    "position": 0,
+    "text": "blocked"
+  }
+}
+```
+
+预期返回：
+
+```json
+{
+  "type": "error",
+  "code": "PERMISSION_DENIED",
+  "message": "write permission required"
+}
 ```
 
 ### Demo 4 — 动态权限变化
