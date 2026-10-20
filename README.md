@@ -570,6 +570,8 @@ go test -count=1 -run TestDemoAcceptance -v ./internal/api
 
 先创建文档并设置权限，然后打开两个终端。
 
+> `websocat` 交互模式下一行就是一条 WebSocket message，因此手工发送 JSON 时必须整条写在一行，不要把格式化的多行 JSON 逐行粘贴。
+
 ### Terminal A
 
 ```bash
@@ -638,13 +640,10 @@ websocat 'ws://localhost:8080/ws?doc_id=main.go&user_id=user-c'
 发送 Join 消息：
 
 ```json
-{
-  "type": "join",
-  "doc_id": "main.go"
-}
+{"type":"join","doc_id":"main.go"}
 ```
 
-预期收到当前文档状态，并确认 `role=read`：
+Expected response（不需要手工输入）：收到当前文档状态，并确认 `role=read`。
 
 ```json
 {
@@ -659,20 +658,10 @@ websocat 'ws://localhost:8080/ws?doc_id=main.go&user_id=user-c'
 然后发送 Edit 消息：
 
 ```json
-{
-  "type": "edit",
-  "request_id": "demo-3",
-  "doc_id": "main.go",
-  "base_version": 3,
-  "operation": {
-    "kind": "insert",
-    "position": 0,
-    "text": "blocked"
-  }
-}
+{"type":"edit","request_id":"demo-3","doc_id":"main.go","base_version":3,"operation":{"kind":"insert","position":0,"text":"blocked"}}
 ```
 
-预期返回：
+Expected response（不需要手工输入）：
 
 ```json
 {
