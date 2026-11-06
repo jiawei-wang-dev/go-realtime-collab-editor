@@ -1,6 +1,15 @@
 package room
 
-import "fmt"
+import (
+	"errors"
+	"fmt"
+)
+
+var (
+	ErrRoomClosed    = errors.New("room is closed")
+	ErrManagerClosed = errors.New("room manager is closed")
+	ErrSlowClient    = errors.New("client send queue is full")
+)
 
 type CodedError struct {
 	Code    string

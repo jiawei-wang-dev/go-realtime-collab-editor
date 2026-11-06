@@ -1,0 +1,45 @@
+#!/bin/bash
+set -euo pipefail
+
+install -d -m 0700 /var/lib/collab/secrets
+gcloud secrets versions access latest --secret='${runtime_env_secret_id}' > /var/lib/collab/secrets/runtime.env
+gcloud secrets versions access latest --secret='${tls_bundle_secret_id}' > /var/lib/collab/secrets/tls.tar.gz
+gcloud secrets versions access latest --secret='${redis_ca_secret_id}' > /var/lib/collab/secrets/redis-ca.pem
+gcloud secrets versions access latest --secret='${mysql_password_secret_id}' > /var/lib/collab/secrets/mysql-password
+gcloud secrets versions access latest --secret='${redis_auth_secret_id}' > /var/lib/collab/secrets/redis-auth
+tar -xzf /var/lib/collab/secrets/tls.tar.gz -C /var/lib/collab/secrets
+chmod -R go-rwx /var/lib/collab/secrets
+mysql_password="$(cat /var/lib/collab/secrets/mysql-password)"
+redis_auth="$(cat /var/lib/collab/secrets/redis-auth)"
+
+docker-credential-gcr configure-docker --registries='${artifact_registry_host}'
+docker pull '${app_image}'
+docker pull gcr.io/cloud-sql-connectors/cloud-sql-proxy:2.18.2
+docker network create collab-runtime 2>/dev/null || true
+docker rm -f collab-cloud-sql-proxy 2>/dev/null || true
+docker run -d --name collab-cloud-sql-proxy --restart=always --network=collab-runtime \
+  gcr.io/cloud-sql-connectors/cloud-sql-proxy:2.18.2 \
+  --address=0.0.0.0 --port=3306 --private-ip '${cloud_sql_connection_name}'
+docker rm -f collab-editor 2>/dev/null || true
+docker run -d --name collab-editor --restart=always \
+  --network=collab-runtime \
+  --env-file /var/lib/collab/secrets/runtime.env \
+  -e APP_ENV=production \
+  -e CLUSTER_MODE=cluster \
+  -e NODE_ID='${node_id}' \
+  -e NODE_INCARNATION='${node_incarnation}' \
+  -e NODE_QUIC_ENDPOINT='${quic_endpoint}' \
+  -e NODE_HTTP_ENDPOINT='${internal_rpc_endpoint}' \
+  -e PORT=8080 \
+  -e QUIC_ADDR=:8443 \
+  -e INTERNAL_RPC_ADDR=:9443 \
+  -e ADMIN_ADDR=127.0.0.1:9090 \
+  -e MYSQL_DSN="collab:$${mysql_password}@tcp(collab-cloud-sql-proxy:3306)/collab_editor?charset=utf8mb4&parseTime=true&loc=UTC" \
+  -e REDIS_ADDR='${redis_host}:${redis_port}' \
+  -e REDIS_PASSWORD="$${redis_auth}" \
+  -e REDIS_TLS_CA_FILE=/run/secrets/redis-ca.pem \
+  -e REDIS_TLS_SERVER_NAME='${redis_host}' \
+  -e ETCD_ENDPOINTS='${etcd_endpoints}' \
+  -p 443:8080/tcp -p 8443:8443/udp -p 9443:9443/tcp \
+  -v /var/lib/collab/secrets:/run/secrets:ro \
+  '${app_image}'

@@ -1,0 +1,28 @@
+#!/bin/bash
+set -euo pipefail
+
+device=/dev/disk/by-id/google-etcd-data
+until test -e "$device"; do sleep 1; done
+if ! blkid "$device" >/dev/null 2>&1; then
+  mkfs.ext4 -F "$device"
+fi
+install -d -m 0700 /var/lib/etcd
+mountpoint -q /var/lib/etcd || mount "$device" /var/lib/etcd
+install -d -m 0700 /var/lib/etcd/tls
+gcloud secrets versions access latest --secret='${tls_bundle_secret_id}' > /var/lib/etcd/tls.tar.gz
+tar -xzf /var/lib/etcd/tls.tar.gz -C /var/lib/etcd/tls
+chmod -R go-rwx /var/lib/etcd/tls
+
+docker pull quay.io/coreos/etcd:v3.5.17
+docker rm -f etcd 2>/dev/null || true
+docker run -d --name etcd --restart=always --network=host \
+  -v /var/lib/etcd/data:/etcd-data \
+  -v /var/lib/etcd/tls:/etcd-tls:ro \
+  quay.io/coreos/etcd:v3.5.17 \
+  /usr/local/bin/etcd --name='${node_name}' --data-dir=/etcd-data \
+  --listen-client-urls=https://${private_ip}:2379 --advertise-client-urls=https://${private_ip}:2379 \
+  --listen-peer-urls=https://${private_ip}:2380 --initial-advertise-peer-urls=https://${private_ip}:2380 \
+  --initial-cluster='${initial_cluster}' --initial-cluster-state=new \
+  --client-cert-auth=true --trusted-ca-file=/etcd-tls/ca.crt --cert-file=/etcd-tls/server.crt --key-file=/etcd-tls/server.key \
+  --peer-client-cert-auth=true --peer-trusted-ca-file=/etcd-tls/ca.crt --peer-cert-file=/etcd-tls/server.crt --peer-key-file=/etcd-tls/server.key \
+  --auto-compaction-retention=1 --auto-compaction-mode=periodic

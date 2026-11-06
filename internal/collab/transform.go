@@ -5,8 +5,8 @@ import (
 	"math"
 )
 
-// Transform rebases an incoming operation over an operation that has already
-// been applied. Positions and lengths are Unicode code-point offsets.
+// Transform relocates an incoming operation against an applied operation.
+// Positions and lengths are measured in Unicode code points.
 func Transform(incoming, applied Operation) (Operation, error) {
 	if err := validateTransformOperand(incoming); err != nil {
 		return Operation{}, fmt.Errorf("invalid incoming operation: %w", err)

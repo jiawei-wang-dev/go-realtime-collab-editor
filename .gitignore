@@ -1,5 +1,10 @@
 # macOS and archive metadata
 .DS_Store
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+crash.log
 **/.DS_Store
 __MACOSX/
 *.zip
@@ -17,3 +22,23 @@ coverage.out
 *.swp
 *.swo
 *~
+
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+certs/
+*.key
+*.pem
+*.crt
+*.cer
+*.p12
+*.pfx
+*.csr
+*.srl
+
+# Client SQLite state (normally stored outside the repository)
+*.db
+*.db-wal
+*.db-shm
+.collab-client/

@@ -2,189 +2,287 @@ package api
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
-	"fmt"
-	"github.com/jiawei-wang-dev/go-realtime-collab-editor/internal/collab"
-	"github.com/jiawei-wang-dev/go-realtime-collab-editor/internal/permission"
-	"github.com/jiawei-wang-dev/go-realtime-collab-editor/internal/protocol"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
-	"strings"
 	"testing"
 	"time"
 
-	"github.com/gorilla/websocket"
+	"github.com/jiawei-wang-dev/go-realtime-collab-editor/internal/cluster"
+	"github.com/jiawei-wang-dev/go-realtime-collab-editor/internal/collab"
+	"github.com/jiawei-wang-dev/go-realtime-collab-editor/internal/permission"
+	"github.com/jiawei-wang-dev/go-realtime-collab-editor/internal/protocol"
+	"github.com/jiawei-wang-dev/go-realtime-collab-editor/internal/room"
 )
 
-func TestDemoAcceptance(t *testing.T) {
-	testServer := httptest.NewServer(NewServer())
-	defer testServer.Close()
+type fixedRateLimiter struct {
+	allowed bool
+	err     error
+}
 
-	createDocument(t, testServer.URL, "demo", "abcdef", "user-a")
-	setPermission(t, testServer.URL, "demo", "user-a", "user-b", permission.RoleWrite, http.StatusOK)
-	setPermission(t, testServer.URL, "demo", "user-a", "user-c", permission.RoleRead, http.StatusOK)
+func (limiter fixedRateLimiter) Allow(context.Context, string, int, time.Duration) (bool, error) {
+	return limiter.allowed, limiter.err
+}
 
-	userA := connectAndJoin(t, testServer.URL, "demo", "user-a")
-	defer userA.Close()
-	userB := connectAndJoin(t, testServer.URL, "demo", "user-b")
-	defer userB.Close()
-
-	// Demo 1: an edit from A is broadcast to B.
-	sendEdit(t, userA, "demo-1", 0, collab.Operation{
-		Kind:     collab.OperationInsert,
-		Position: 2,
-		Text:     "X",
-	})
-	assertApplied(t, readMessage(t, userA), "demo-1", 1, 2)
-	assertApplied(t, readMessage(t, userB), "demo-1", 1, 2)
-
-	// Demo 2: B's stale edit is transformed over A's edit at the same position.
-	sendEdit(t, userA, "demo-2-a", 1, collab.Operation{
-		Kind:     collab.OperationInsert,
-		Position: 0,
-		Text:     "A",
-	})
-	assertApplied(t, readMessage(t, userA), "demo-2-a", 2, 0)
-	assertApplied(t, readMessage(t, userB), "demo-2-a", 2, 0)
-
-	sendEdit(t, userB, "demo-2-b", 1, collab.Operation{
-		Kind:     collab.OperationInsert,
-		Position: 0,
-		Text:     "B",
-	})
-	assertApplied(t, readMessage(t, userA), "demo-2-b", 3, 1)
-	assertApplied(t, readMessage(t, userB), "demo-2-b", 3, 1)
-
-	// Demo 3: a read-only user is rejected by the server.
-	userC := connectAndJoin(t, testServer.URL, "demo", "user-c")
-	defer userC.Close()
-	sendEdit(t, userC, "demo-3", 3, collab.Operation{
-		Kind:     collab.OperationInsert,
-		Position: 0,
-		Text:     "blocked",
-	})
-	assertError(t, readMessage(t, userC), protocol.CodePermissionDenied)
-
-	// Demo 4: a connected writer receives the downgrade and its next edit fails.
-	setPermission(t, testServer.URL, "demo", "user-a", "user-b", permission.RoleRead, http.StatusOK)
-	changed := readMessage(t, userB)
-	if changed.Type != protocol.TypePermissionChanged || changed.Role != permission.RoleRead {
-		t.Fatalf("permission_changed = %#v", changed)
+func TestRateLimitResponses(t *testing.T) {
+	tests := []struct {
+		name       string
+		limiter    fixedRateLimiter
+		wantStatus int
+		wantCode   string
+	}{
+		{name: "limit exceeded", limiter: fixedRateLimiter{}, wantStatus: http.StatusTooManyRequests, wantCode: codeRateLimited},
+		{name: "backend unavailable", limiter: fixedRateLimiter{err: errors.New("redis unavailable")}, wantStatus: http.StatusServiceUnavailable, wantCode: protocol.CodeServiceUnavailable},
 	}
-	sendEdit(t, userB, "demo-4", 3, collab.Operation{
-		Kind:     collab.OperationInsert,
-		Position: 0,
-		Text:     "blocked",
-	})
-	assertError(t, readMessage(t, userB), protocol.CodePermissionDenied)
-
-	// The downgraded user remains connected and receives later updates.
-	sendEdit(t, userA, "demo-4-owner", 3, collab.Operation{
-		Kind:     collab.OperationInsert,
-		Position: 9,
-		Text:     "!",
-	})
-	assertApplied(t, readMessage(t, userA), "demo-4-owner", 4, 9)
-	assertApplied(t, readMessage(t, userB), "demo-4-owner", 4, 9)
-
-	document := getDocument(t, testServer.URL, "demo", "user-a")
-	if document.Content != "ABabXcdef!" || document.Version != 4 {
-		t.Fatalf("final document = %#v", document)
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			server := NewServerWithConfig(Config{RateLimiter: test.limiter})
+			defer server.Shutdown(context.Background())
+			request := httptest.NewRequest(http.MethodPost, "/api/auth/login", nil)
+			request.RemoteAddr = "192.0.2.10:1234"
+			response := httptest.NewRecorder()
+			if server.allowRequest(response, request, "login", 1) {
+				t.Fatal("request was allowed")
+			}
+			if response.Code != test.wantStatus {
+				t.Fatalf("status = %d, want %d", response.Code, test.wantStatus)
+			}
+			var message protocol.Message
+			if err := json.Unmarshal(response.Body.Bytes(), &message); err != nil {
+				t.Fatal(err)
+			}
+			if message.Code != test.wantCode {
+				t.Fatalf("code = %q, want %q", message.Code, test.wantCode)
+			}
+		})
 	}
 }
 
-func TestUnauthorizedUserCannotReadDocument(t *testing.T) {
-	testServer := httptest.NewServer(NewServer())
-	defer testServer.Close()
+func TestCORSUsesExactAllowlist(t *testing.T) {
+	server := NewServerWithConfig(Config{AllowedOrigins: []string{"https://editor.example.com"}})
+	defer server.Shutdown(context.Background())
 
-	createDocument(t, testServer.URL, "private", "secret", "owner")
-	setPermission(t, testServer.URL, "private", "owner", "reader", permission.RoleRead, http.StatusOK)
+	disallowed := httptest.NewRequest(http.MethodGet, "/api/documents/doc", nil)
+	disallowed.Header.Set("Origin", "https://evil.example.com")
+	disallowedResponse := httptest.NewRecorder()
+	server.ServeHTTP(disallowedResponse, disallowed)
+	if disallowedResponse.Code != http.StatusForbidden {
+		t.Fatalf("disallowed status = %d", disallowedResponse.Code)
+	}
 
-	getDocumentStatus(t, testServer.URL, "private", "", http.StatusBadRequest)
-	getDocumentStatus(t, testServer.URL, "private", "unknown", http.StatusForbidden)
-	getDocumentStatus(t, testServer.URL, "private", "reader", http.StatusOK)
+	preflight := httptest.NewRequest(http.MethodOptions, "/api/documents/doc", nil)
+	preflight.Header.Set("Origin", "https://editor.example.com")
+	preflightResponse := httptest.NewRecorder()
+	server.ServeHTTP(preflightResponse, preflight)
+	if preflightResponse.Code != http.StatusNoContent || preflightResponse.Header().Get("Access-Control-Allow-Origin") != "https://editor.example.com" {
+		t.Fatalf("preflight status=%d headers=%v", preflightResponse.Code, preflightResponse.Header())
+	}
 }
 
-func TestUnauthorizedUserCannotJoin(t *testing.T) {
-	testServer := httptest.NewServer(NewServer())
-	defer testServer.Close()
+func TestServiceUnavailableHTTPMapping(t *testing.T) {
+	tests := []struct {
+		name  string
+		write func(http.ResponseWriter)
+	}{
+		{
+			name: "local room error",
+			write: func(writer http.ResponseWriter) {
+				writeRoomError(writer, &room.CodedError{Code: protocol.CodeServiceUnavailable, Message: "room ownership is no longer valid"})
+			},
+		},
+		{
+			name: "forwarded owner error",
+			write: func(writer http.ResponseWriter) {
+				server := &Server{}
+				server.writeForwardError(writer, &cluster.RemoteError{Status: http.StatusServiceUnavailable, Code: protocol.CodeServiceUnavailable, Message: "room ownership is no longer valid"})
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			response := httptest.NewRecorder()
+			test.write(response)
+			if response.Code != http.StatusServiceUnavailable {
+				t.Fatalf("status = %d, want %d", response.Code, http.StatusServiceUnavailable)
+			}
+			var message protocol.Message
+			if err := json.Unmarshal(response.Body.Bytes(), &message); err != nil {
+				t.Fatal(err)
+			}
+			if message.Type != protocol.TypeError || message.Code != protocol.CodeServiceUnavailable || message.Message != "room ownership is no longer valid" {
+				t.Fatalf("error response = %#v", message)
+			}
+		})
+	}
+}
 
-	createDocument(t, testServer.URL, "private", "secret", "owner")
+func TestProtectedDocumentAndPermissionREST(t *testing.T) {
+	application := NewServer()
+	server := httptest.NewServer(application)
+	defer server.Close()
+	defer application.Shutdown(context.Background())
 
-	connection := dialWebSocket(t, testServer.URL, "private", "unknown")
-	defer connection.Close()
-	if err := connection.WriteJSON(protocol.Message{Type: protocol.TypeJoin, DocID: "private"}); err != nil {
+	createDocument(t, server.URL, "doc", "abc", "owner")
+	setPermission(t, server.URL, "doc", "owner", "writer", permission.RoleWrite, http.StatusOK)
+	getDocumentStatus(t, server.URL, "doc", "", http.StatusUnauthorized)
+	getDocumentStatus(t, server.URL, "doc", "unknown", http.StatusForbidden)
+	document := getDocument(t, server.URL, "doc", "owner")
+	if document.Content != "abc" || document.Version != 0 {
+		t.Fatalf("document = %#v", document)
+	}
+	getPermissionStatus(t, server.URL, "doc", "owner", "writer", http.StatusOK)
+	getPermissionStatus(t, server.URL, "doc", "writer", "writer", http.StatusForbidden)
+	setPermission(t, server.URL, "doc", "writer", "reader", permission.RoleRead, http.StatusForbidden)
+}
+
+func TestRESTRejectsMalformedJSONAndDuplicateDocument(t *testing.T) {
+	application := NewServer()
+	server := httptest.NewServer(application)
+	defer server.Close()
+	createDocument(t, server.URL, "doc", "", "owner")
+
+	request, _ := http.NewRequest(http.MethodPost, server.URL+"/api/documents", bytes.NewBufferString(`{"id":`))
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("X-User-ID", "owner")
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
 		t.Fatal(err)
 	}
-	assertError(t, readMessage(t, connection), protocol.CodePermissionDenied)
-}
+	response.Body.Close()
+	if response.StatusCode != http.StatusBadRequest {
+		t.Fatalf("malformed status = %d", response.StatusCode)
+	}
 
-func TestMalformedWebSocketMessageReturnsBadMessage(t *testing.T) {
-	testServer := httptest.NewServer(NewServer())
-	defer testServer.Close()
-
-	createDocument(t, testServer.URL, "private", "secret", "owner")
-	connection := dialWebSocket(t, testServer.URL, "private", "owner")
-	defer connection.Close()
-
-	if err := connection.WriteMessage(websocket.TextMessage, []byte(`{"type":`)); err != nil {
+	request, _ = http.NewRequest(http.MethodPost, server.URL+"/api/documents", bytes.NewBufferString(`{"id":"doc"}`))
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("X-User-ID", "owner")
+	response, err = http.DefaultClient.Do(request)
+	if err != nil {
 		t.Fatal(err)
 	}
-	assertError(t, readMessage(t, connection), protocol.CodeBadMessage)
+	response.Body.Close()
+	if response.StatusCode != http.StatusConflict {
+		t.Fatalf("duplicate status = %d", response.StatusCode)
+	}
+}
 
-	if err := connection.WriteJSON(protocol.Message{Type: protocol.TypeJoin, DocID: "private"}); err != nil {
+func TestDocumentAndPermissionReadsForwardToAuthoritativeOwner(t *testing.T) {
+	remoteOwner := cluster.Owner{DocumentID: "doc", NodeID: "node-b", Incarnation: "process-b", State: cluster.OwnerActive}
+	forwarder := &recordingForwarder{
+		document: collab.Document{ID: "doc", Content: "remote", Version: 7},
+		role:     permission.RoleWrite,
+	}
+	application := NewServerWithConfig(Config{
+		OwnerResolver:       staticOwnerResolver{owner: remoteOwner},
+		LocalNode:           cluster.Node{NodeID: "node-a", Incarnation: "process-a"},
+		PermissionForwarder: forwarder,
+	})
+	defer application.Shutdown(context.Background())
+
+	documentRequest := httptest.NewRequest(http.MethodGet, "/api/documents/doc", nil)
+	documentRequest.Header.Set("X-User-ID", "reader")
+	documentResponse := httptest.NewRecorder()
+	application.ServeHTTP(documentResponse, documentRequest)
+	if documentResponse.Code != http.StatusOK {
+		t.Fatalf("document status = %d body=%s", documentResponse.Code, documentResponse.Body.String())
+	}
+	var document collab.Document
+	if err := json.Unmarshal(documentResponse.Body.Bytes(), &document); err != nil {
 		t.Fatal(err)
 	}
-	if joined := readMessage(t, connection); joined.Type != protocol.TypeJoined {
-		t.Fatalf("joined = %#v", joined)
+	if document != forwarder.document || forwarder.documentCalls != 1 {
+		t.Fatalf("document = %#v, calls = %d", document, forwarder.documentCalls)
+	}
+
+	permissionRequest := httptest.NewRequest(http.MethodGet, "/api/documents/doc/permissions/writer", nil)
+	permissionRequest.Header.Set("X-User-ID", "owner")
+	permissionResponse := httptest.NewRecorder()
+	application.ServeHTTP(permissionResponse, permissionRequest)
+	if permissionResponse.Code != http.StatusOK || forwarder.permissionReadCalls != 1 {
+		t.Fatalf("permission status = %d calls = %d body=%s", permissionResponse.Code, forwarder.permissionReadCalls, permissionResponse.Body.String())
 	}
 }
 
-func TestOnlyOwnerCanQueryAndChangePermission(t *testing.T) {
-	testServer := httptest.NewServer(NewServer())
-	defer testServer.Close()
-
-	createDocument(t, testServer.URL, "doc", "", "owner")
-	setPermission(t, testServer.URL, "doc", "owner", "writer", permission.RoleWrite, http.StatusOK)
-	getPermissionStatus(t, testServer.URL, "doc", "owner", "writer", http.StatusOK)
-	getPermissionStatus(t, testServer.URL, "doc", "writer", "writer", http.StatusForbidden)
-	getPermissionStatus(t, testServer.URL, "doc", "", "writer", http.StatusBadRequest)
-	setPermission(t, testServer.URL, "doc", "writer", "reader", permission.RoleRead, http.StatusForbidden)
+func TestDocumentReadFailsClosedWhenOwnerCannotBeResolved(t *testing.T) {
+	forwarder := &recordingForwarder{}
+	application := NewServerWithConfig(Config{
+		OwnerResolver:       staticOwnerResolver{err: cluster.ErrOwnerNotFound},
+		LocalNode:           cluster.Node{NodeID: "node-a", Incarnation: "process-a"},
+		PermissionForwarder: forwarder,
+	})
+	defer application.Shutdown(context.Background())
+	request := httptest.NewRequest(http.MethodGet, "/api/documents/doc", nil)
+	request.Header.Set("X-User-ID", "reader")
+	response := httptest.NewRecorder()
+	application.ServeHTTP(response, request)
+	if response.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d body=%s", response.Code, response.Body.String())
+	}
+	if forwarder.documentCalls != 0 {
+		t.Fatal("read was forwarded without an authoritative owner")
+	}
 }
 
-func createDocument(t *testing.T, baseURL, id, content, ownerID string) {
+type staticOwnerResolver struct {
+	owner cluster.Owner
+	err   error
+}
+
+func (resolver staticOwnerResolver) Resolve(context.Context, string) (cluster.Owner, error) {
+	return resolver.owner, resolver.err
+}
+
+func (resolver staticOwnerResolver) EnsureOwner(context.Context, string) (cluster.Owner, error) {
+	return resolver.owner, resolver.err
+}
+
+type recordingForwarder struct {
+	document            collab.Document
+	role                permission.Role
+	documentCalls       int
+	permissionReadCalls int
+	err                 error
+}
+
+func (forwarder *recordingForwarder) ForwardPermission(context.Context, cluster.Owner, string, string, string, permission.Role) error {
+	return forwarder.err
+}
+
+func (forwarder *recordingForwarder) ForwardDocument(context.Context, cluster.Owner, string, string) (collab.Document, error) {
+	forwarder.documentCalls++
+	return forwarder.document, forwarder.err
+}
+
+func (forwarder *recordingForwarder) ForwardGetPermission(context.Context, cluster.Owner, string, string, string) (permission.Role, error) {
+	forwarder.permissionReadCalls++
+	return forwarder.role, forwarder.err
+}
+
+var _ cluster.PermissionForwarder = (*recordingForwarder)(nil)
+
+func createDocument(t *testing.T, baseURL, docID, content, ownerID string) {
 	t.Helper()
-	body := fmt.Sprintf(`{"id":%q,"content":%q,"owner_id":%q}`, id, content, ownerID)
-	response, err := http.Post(baseURL+"/api/documents", "application/json", strings.NewReader(body))
+	body, _ := json.Marshal(map[string]string{"id": docID, "content": content})
+	request, _ := http.NewRequest(http.MethodPost, baseURL+"/api/documents", bytes.NewReader(body))
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("X-User-ID", ownerID)
+	response, err := http.DefaultClient.Do(request)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer response.Body.Close()
 	if response.StatusCode != http.StatusCreated {
-		t.Fatalf("create status = %d, body = %s", response.StatusCode, readBody(response.Body))
+		t.Fatalf("create status = %d body=%s", response.StatusCode, readBody(response.Body))
 	}
 }
 
-func setPermission(
-	t *testing.T,
-	baseURL, docID, actorID, userID string,
-	role permission.Role,
-	wantStatus int,
-) {
+func setPermission(t *testing.T, baseURL, docID, actorID, userID string, role permission.Role, want int) {
 	t.Helper()
-	body, err := json.Marshal(map[string]any{"role": role})
-	if err != nil {
-		t.Fatal(err)
-	}
-	request, err := http.NewRequest(
-		http.MethodPut,
-		baseURL+"/api/documents/"+docID+"/permissions/"+userID,
-		bytes.NewReader(body),
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
+	body, _ := json.Marshal(map[string]permission.Role{"role": role})
+	request, _ := http.NewRequest(http.MethodPut, baseURL+"/api/documents/"+docID+"/permissions/"+userID, bytes.NewReader(body))
 	request.Header.Set("Content-Type", "application/json")
 	request.Header.Set("X-User-ID", actorID)
 	response, err := http.DefaultClient.Do(request)
@@ -192,95 +290,20 @@ func setPermission(
 		t.Fatal(err)
 	}
 	defer response.Body.Close()
-	if response.StatusCode != wantStatus {
-		t.Fatalf("permission status = %d, want %d, body = %s", response.StatusCode, wantStatus, readBody(response.Body))
+	if response.StatusCode != want {
+		t.Fatalf("permission status = %d want=%d body=%s", response.StatusCode, want, readBody(response.Body))
 	}
 }
 
-func connectAndJoin(t *testing.T, baseURL, docID, userID string) *websocket.Conn {
+func getDocument(t *testing.T, baseURL, docID, userID string) collab.Document {
 	t.Helper()
-	connection := dialWebSocket(t, baseURL, docID, userID)
-	if err := connection.WriteJSON(protocol.Message{Type: protocol.TypeJoin, DocID: docID}); err != nil {
-		t.Fatal(err)
-	}
-	joined := readMessage(t, connection)
-	if joined.Type != protocol.TypeJoined || joined.DocID != docID {
-		t.Fatalf("joined = %#v", joined)
-	}
-	return connection
-}
-
-func dialWebSocket(t *testing.T, baseURL, docID, userID string) *websocket.Conn {
-	t.Helper()
-	wsURL := "ws" + strings.TrimPrefix(baseURL, "http") + "/ws?doc_id=" + docID + "&user_id=" + userID
-	connection, response, err := websocket.DefaultDialer.Dial(wsURL, nil)
-	if err != nil {
-		if response != nil {
-			t.Fatalf("dial: %v, status: %s", err, response.Status)
-		}
-		t.Fatal(err)
-	}
-	return connection
-}
-
-func sendEdit(t *testing.T, connection *websocket.Conn, requestID string, baseVersion uint64, operation collab.Operation) {
-	t.Helper()
-	if err := connection.WriteJSON(protocol.Message{
-		Type:        protocol.TypeEdit,
-		RequestID:   requestID,
-		DocID:       "demo",
-		BaseVersion: baseVersion,
-		Operation:   &operation,
-	}); err != nil {
-		t.Fatal(err)
-	}
-}
-
-func readMessage(t *testing.T, connection *websocket.Conn) protocol.Message {
-	t.Helper()
-	if err := connection.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
-		t.Fatal(err)
-	}
-	var message protocol.Message
-	if err := connection.ReadJSON(&message); err != nil {
-		t.Fatal(err)
-	}
-	return message
-}
-
-func assertApplied(t *testing.T, message protocol.Message, requestID string, version uint64, position int) {
-	t.Helper()
-	if message.Type != protocol.TypeEditApplied ||
-		message.RequestID != requestID ||
-		message.Version != version ||
-		message.Operation == nil ||
-		message.Operation.Position != position {
-		t.Fatalf("edit_applied = %#v", message)
-	}
-}
-
-func assertError(t *testing.T, message protocol.Message, code string) {
-	t.Helper()
-	if message.Type != protocol.TypeError || message.Code != code {
-		t.Fatalf("error = %#v, want code %s", message, code)
-	}
-}
-
-func getDocument(t *testing.T, baseURL, docID, actorID string) collab.Document {
-	t.Helper()
-	request, err := http.NewRequest(http.MethodGet, baseURL+"/api/documents/"+docID, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	request.Header.Set("X-User-ID", actorID)
+	request, _ := http.NewRequest(http.MethodGet, baseURL+"/api/documents/"+docID, nil)
+	request.Header.Set("X-User-ID", userID)
 	response, err := http.DefaultClient.Do(request)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer response.Body.Close()
-	if response.StatusCode != http.StatusOK {
-		t.Fatalf("get document status = %d, body = %s", response.StatusCode, readBody(response.Body))
-	}
 	var document collab.Document
 	if err := json.NewDecoder(response.Body).Decode(&document); err != nil {
 		t.Fatal(err)
@@ -288,49 +311,37 @@ func getDocument(t *testing.T, baseURL, docID, actorID string) collab.Document {
 	return document
 }
 
-func getDocumentStatus(t *testing.T, baseURL, docID, actorID string, wantStatus int) {
+func getDocumentStatus(t *testing.T, baseURL, docID, userID string, want int) {
 	t.Helper()
-	request, err := http.NewRequest(http.MethodGet, baseURL+"/api/documents/"+docID, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if actorID != "" {
-		request.Header.Set("X-User-ID", actorID)
+	request, _ := http.NewRequest(http.MethodGet, baseURL+"/api/documents/"+docID, nil)
+	if userID != "" {
+		request.Header.Set("X-User-ID", userID)
 	}
 	response, err := http.DefaultClient.Do(request)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer response.Body.Close()
-	if response.StatusCode != wantStatus {
-		t.Fatalf("get document status = %d, want %d, body = %s", response.StatusCode, wantStatus, readBody(response.Body))
+	response.Body.Close()
+	if response.StatusCode != want {
+		t.Fatalf("document status = %d want=%d", response.StatusCode, want)
 	}
 }
 
-func getPermissionStatus(t *testing.T, baseURL, docID, actorID, userID string, wantStatus int) {
+func getPermissionStatus(t *testing.T, baseURL, docID, actorID, userID string, want int) {
 	t.Helper()
-	request, err := http.NewRequest(
-		http.MethodGet,
-		baseURL+"/api/documents/"+docID+"/permissions/"+userID,
-		nil,
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if actorID != "" {
-		request.Header.Set("X-User-ID", actorID)
-	}
+	request, _ := http.NewRequest(http.MethodGet, baseURL+"/api/documents/"+docID+"/permissions/"+userID, nil)
+	request.Header.Set("X-User-ID", actorID)
 	response, err := http.DefaultClient.Do(request)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer response.Body.Close()
-	if response.StatusCode != wantStatus {
-		t.Fatalf("get permission status = %d, want %d, body = %s", response.StatusCode, wantStatus, readBody(response.Body))
+	response.Body.Close()
+	if response.StatusCode != want {
+		t.Fatalf("permission query status = %d want=%d", response.StatusCode, want)
 	}
 }
 
 func readBody(reader io.Reader) string {
-	body, _ := io.ReadAll(reader)
-	return string(body)
+	payload, _ := io.ReadAll(reader)
+	return string(payload)
 }

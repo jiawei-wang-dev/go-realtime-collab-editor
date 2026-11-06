@@ -1,0 +1,8 @@
+ALTER TABLE documents
+    ADD COLUMN fencing_token BIGINT UNSIGNED NOT NULL DEFAULT 0;
+
+ALTER TABLE documents
+    ADD COLUMN owner_node_id VARCHAR(128) NULL;
+
+ALTER TABLE operation_logs
+    ADD COLUMN fencing_token BIGINT UNSIGNED NOT NULL DEFAULT 0;

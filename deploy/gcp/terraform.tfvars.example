@@ -1,0 +1,10 @@
+project_id  = "replace-with-project-id"
+region      = "australia-southeast1"
+name_prefix = "collab-prod"
+app_image   = "australia-southeast1-docker.pkg.dev/replace-with-project-id/collab/server@sha256:replace-with-image-digest"
+
+runtime_env_secret_id       = "collab-prod-runtime-env"
+etcd_tls_bundle_secret_id   = "collab-prod-etcd-tls"
+app_tls_bundle_secret_ids   = ["collab-prod-node-1-tls", "collab-prod-node-2-tls", "collab-prod-node-3-tls"]
+app_node_incarnations       = ["release-001-node-1", "release-001-node-2", "release-001-node-3"]
+alert_email                 = "operations@example.com"

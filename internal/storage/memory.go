@@ -1,90 +1,368 @@
 package storage
 
 import (
-	"errors"
+	"context"
 	"fmt"
+	"sync"
+
 	"github.com/jiawei-wang-dev/go-realtime-collab-editor/internal/collab"
 	"github.com/jiawei-wang-dev/go-realtime-collab-editor/internal/permission"
-	"sync"
 )
-
-var ErrDocumentNotFound = errors.New("document not found")
 
 type Memory struct {
 	mu          sync.RWMutex
 	documents   map[string]collab.Document
 	operations  map[string][]collab.AppliedOperation
 	permissions map[string]map[string]permission.Role
+	requests    map[string]map[string]struct{}
+	snapshots   map[string]map[uint64]Snapshot
+	authorities map[string]WriteAuthority
 }
+
+var _ Store = (*Memory)(nil)
 
 func NewMemory() *Memory {
 	return &Memory{
 		documents:   make(map[string]collab.Document),
 		operations:  make(map[string][]collab.AppliedOperation),
 		permissions: make(map[string]map[string]permission.Role),
+		requests:    make(map[string]map[string]struct{}),
+		snapshots:   make(map[string]map[uint64]Snapshot),
+		authorities: make(map[string]WriteAuthority),
 	}
 }
 
-func (m *Memory) CreateDocument(id, content, ownerID string) (collab.Document, error) {
+func (m *Memory) GetWriteAuthority(ctx context.Context, docID string) (WriteAuthority, error) {
+	if err := ctx.Err(); err != nil {
+		return WriteAuthority{}, err
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if _, ok := m.documents[docID]; !ok {
+		return WriteAuthority{}, ErrNotFound
+	}
+	return m.authorities[docID], nil
+}
+
+func (m *Memory) ActivateOwnership(ctx context.Context, docID string, authority WriteAuthority) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := ValidateWriteAuthority(authority); err != nil {
+		return err
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if _, ok := m.documents[docID]; !ok {
+		return ErrNotFound
+	}
+	if authority.FencingToken <= m.authorities[docID].FencingToken {
+		return ErrOwnershipConflict
+	}
+	m.authorities[docID] = authority
+	return nil
+}
 
+func (m *Memory) CreateDocument(ctx context.Context, id, content, ownerID string) (collab.Document, error) {
+	if err := ctx.Err(); err != nil {
+		return collab.Document{}, err
+	}
 	if id == "" || ownerID == "" {
 		return collab.Document{}, fmt.Errorf("document id and owner id are required")
 	}
-	if _, exists := m.documents[id]; exists {
-		return collab.Document{}, fmt.Errorf("document %q already exists", id)
-	}
 
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, exists := m.documents[id]; exists {
+		return collab.Document{}, ErrAlreadyExists
+	}
 	document := collab.Document{ID: id, Content: content}
 	m.documents[id] = document
 	m.permissions[id] = map[string]permission.Role{ownerID: permission.RoleOwner}
+	m.requests[id] = make(map[string]struct{})
+	m.snapshots[id] = map[uint64]Snapshot{0: {DocumentID: id, Version: 0, Content: content}}
 	return document, nil
 }
 
-func (m *Memory) Document(id string) (collab.Document, error) {
+func (m *Memory) LoadDocument(ctx context.Context, id string) (DocumentState, error) {
+	if err := ctx.Err(); err != nil {
+		return DocumentState{}, err
+	}
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-
 	document, ok := m.documents[id]
 	if !ok {
-		return collab.Document{}, ErrDocumentNotFound
+		return DocumentState{}, ErrNotFound
 	}
-	return document, nil
+	return DocumentState{
+		Document:    document,
+		Operations:  cloneOperations(m.operations[id]),
+		Permissions: clonePermissions(m.permissions[id]),
+	}, nil
 }
 
-func (m *Memory) SaveApplied(document collab.Document, operation collab.AppliedOperation) {
+func (m *Memory) LoadRecoveryState(ctx context.Context, id string, authority WriteAuthority) (RecoveryState, error) {
+	if err := ctx.Err(); err != nil {
+		return RecoveryState{}, err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	document, ok := m.documents[id]
+	if !ok {
+		return RecoveryState{}, ErrNotFound
+	}
+	if m.authorities[id] != authority || !authority.Valid() {
+		return RecoveryState{}, ErrFenced
+	}
+	snapshot := m.latestSnapshotLocked(id)
+	if snapshot.DocumentID == "" {
+		snapshot = Snapshot{DocumentID: id, Version: document.Version, Content: document.Content}
+		if m.snapshots[id] == nil {
+			m.snapshots[id] = make(map[uint64]Snapshot)
+		}
+		m.snapshots[id][snapshot.Version] = snapshot
+	}
+	return RecoveryState{
+		Document:    document,
+		Snapshot:    snapshot,
+		Operations:  operationsAfter(m.operations[id], snapshot.Version),
+		Permissions: clonePermissions(m.permissions[id]),
+	}, nil
+}
+
+func (m *Memory) GetDocument(ctx context.Context, id string) (collab.Document, error) {
+	state, err := m.LoadDocument(ctx, id)
+	return state.Document, err
+}
+
+func (m *Memory) GetPermission(ctx context.Context, docID, userID string) (permission.Role, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if _, ok := m.documents[docID]; !ok {
+		return "", ErrNotFound
+	}
+	role, ok := m.permissions[docID][userID]
+	if !ok {
+		return "", ErrNotFound
+	}
+	return role, nil
+}
+
+func (m *Memory) GetPermissions(ctx context.Context, docID string) (map[string]permission.Role, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if _, ok := m.documents[docID]; !ok {
+		return nil, ErrNotFound
+	}
+	return clonePermissions(m.permissions[docID]), nil
+}
+
+func (m *Memory) SetPermission(ctx context.Context, commit PermissionCommit) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := ValidateWriteAuthority(commit.Authority); err != nil {
+		return err
+	}
+	if commit.UserID == "" || !commit.Role.Valid() {
+		return fmt.Errorf("valid target user and role are required")
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, ok := m.documents[commit.DocumentID]; !ok {
+		return ErrNotFound
+	}
+	if m.authorities[commit.DocumentID] != commit.Authority {
+		return ErrFenced
+	}
+	if !m.permissions[commit.DocumentID][commit.ActorID].CanChangePermissions() {
+		return ErrPermissionDenied
+	}
+	m.permissions[commit.DocumentID][commit.UserID] = commit.Role
+	return nil
+}
+
+func (m *Memory) CommitEdit(ctx context.Context, commit EditCommit) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := ValidateWriteAuthority(commit.Authority); err != nil {
+		return err
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	m.documents[document.ID] = document
-	m.operations[document.ID] = append(m.operations[document.ID], operation)
+	current, ok := m.documents[commit.Document.ID]
+	if !ok {
+		return ErrNotFound
+	}
+	if m.authorities[commit.Document.ID] != commit.Authority {
+		return ErrFenced
+	}
+	if _, exists := m.requests[commit.Document.ID][commit.Operation.ID]; exists {
+		return ErrDuplicateRequest
+	}
+	if current.Version != commit.ExpectedVersion ||
+		commit.Document.Version != commit.ExpectedVersion+1 ||
+		commit.Operation.Version != commit.Document.Version {
+		return ErrVersionConflict
+	}
+
+	m.documents[commit.Document.ID] = commit.Document
+	m.operations[commit.Document.ID] = append(m.operations[commit.Document.ID], commit.Operation)
+	if m.requests[commit.Document.ID] == nil {
+		m.requests[commit.Document.ID] = make(map[string]struct{})
+	}
+	m.requests[commit.Document.ID][commit.Operation.ID] = struct{}{}
+	return nil
 }
 
-func (m *Memory) Operations(docID string) []collab.AppliedOperation {
+func (m *Memory) LoadOperations(ctx context.Context, docID string) ([]collab.AppliedOperation, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-
-	return append([]collab.AppliedOperation(nil), m.operations[docID]...)
+	if _, ok := m.documents[docID]; !ok {
+		return nil, ErrNotFound
+	}
+	return cloneOperations(m.operations[docID]), nil
 }
 
-func (m *Memory) Permissions(docID string) map[string]permission.Role {
+func (m *Memory) LoadOperationsAfter(ctx context.Context, docID string, version uint64) ([]collab.AppliedOperation, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	m.mu.RLock()
 	defer m.mu.RUnlock()
+	if _, ok := m.documents[docID]; !ok {
+		return nil, ErrNotFound
+	}
+	return operationsAfter(m.operations[docID], version), nil
+}
 
-	result := make(map[string]permission.Role, len(m.permissions[docID]))
-	for userID, role := range m.permissions[docID] {
-		result[userID] = role
+func (m *Memory) GetAppliedOperation(ctx context.Context, docID, requestID string) (collab.AppliedOperation, error) {
+	if err := ctx.Err(); err != nil {
+		return collab.AppliedOperation{}, err
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if _, ok := m.documents[docID]; !ok {
+		return collab.AppliedOperation{}, ErrNotFound
+	}
+	for _, applied := range m.operations[docID] {
+		if applied.ID == requestID {
+			return applied, nil
+		}
+	}
+	return collab.AppliedOperation{}, ErrNotFound
+}
+
+func (m *Memory) GetLatestSnapshot(ctx context.Context, docID string) (Snapshot, error) {
+	if err := ctx.Err(); err != nil {
+		return Snapshot{}, err
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if _, ok := m.documents[docID]; !ok {
+		return Snapshot{}, ErrNotFound
+	}
+	snapshot := m.latestSnapshotLocked(docID)
+	if snapshot.DocumentID == "" {
+		return Snapshot{}, ErrNotFound
+	}
+	return snapshot, nil
+}
+
+func (m *Memory) EnsureBaselineSnapshot(ctx context.Context, docID string, authority WriteAuthority) (Snapshot, error) {
+	if err := ctx.Err(); err != nil {
+		return Snapshot{}, err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	document, ok := m.documents[docID]
+	if !ok {
+		return Snapshot{}, ErrNotFound
+	}
+	if m.authorities[docID] != authority || !authority.Valid() {
+		return Snapshot{}, ErrFenced
+	}
+	if snapshot := m.latestSnapshotLocked(docID); snapshot.DocumentID != "" {
+		return snapshot, nil
+	}
+	snapshot := Snapshot{DocumentID: docID, Version: document.Version, Content: document.Content}
+	if m.snapshots[docID] == nil {
+		m.snapshots[docID] = make(map[uint64]Snapshot)
+	}
+	m.snapshots[docID][snapshot.Version] = snapshot
+	return snapshot, nil
+}
+
+func (m *Memory) SaveSnapshot(ctx context.Context, commit SnapshotCommit) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := ValidateWriteAuthority(commit.Authority); err != nil {
+		return err
+	}
+	snapshot := commit.Snapshot
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, ok := m.documents[snapshot.DocumentID]; !ok {
+		return ErrNotFound
+	}
+	if m.authorities[snapshot.DocumentID] != commit.Authority {
+		return ErrFenced
+	}
+	if snapshot.Version > m.documents[snapshot.DocumentID].Version {
+		return ErrVersionConflict
+	}
+	if m.snapshots[snapshot.DocumentID] == nil {
+		m.snapshots[snapshot.DocumentID] = make(map[uint64]Snapshot)
+	}
+	if _, exists := m.snapshots[snapshot.DocumentID][snapshot.Version]; exists {
+		return ErrAlreadyExists
+	}
+	m.snapshots[snapshot.DocumentID][snapshot.Version] = snapshot
+	return nil
+}
+
+func (m *Memory) latestSnapshotLocked(docID string) Snapshot {
+	var latest Snapshot
+	for version, snapshot := range m.snapshots[docID] {
+		if latest.DocumentID == "" || version > latest.Version {
+			latest = snapshot
+		}
+	}
+	return latest
+}
+
+func operationsAfter(source []collab.AppliedOperation, version uint64) []collab.AppliedOperation {
+	result := make([]collab.AppliedOperation, 0, len(source))
+	for _, applied := range source {
+		if applied.Version > version {
+			result = append(result, applied)
+		}
 	}
 	return result
 }
 
-func (m *Memory) SetPermission(docID, userID string, role permission.Role) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+func (m *Memory) Close() error { return nil }
 
-	if m.permissions[docID] == nil {
-		m.permissions[docID] = make(map[string]permission.Role)
+func cloneOperations(source []collab.AppliedOperation) []collab.AppliedOperation {
+	return append([]collab.AppliedOperation(nil), source...)
+}
+
+func clonePermissions(source map[string]permission.Role) map[string]permission.Role {
+	result := make(map[string]permission.Role, len(source))
+	for userID, role := range source {
+		result[userID] = role
 	}
-	m.permissions[docID][userID] = role
+	return result
 }
