@@ -1,316 +1,219 @@
-# Realtime Collaborative Code Editor — Go Backend
+# Realtime Collaborative Code Editor
 
-使用 Go 构建的实时多人代码编辑后端。REST API 运行于 TCP，实时协作使用 QUIC（UDP + TLS 1.3），核心业务采用单文档单 Room goroutine、Version + OT、MySQL 事务、JWT + Redis Session、Snapshot + Operation Log Replay。
+基于 Go、QUIC 和多节点 Ownership 的实时协作编辑后端。
+A real-time collaborative editing backend built with Go, QUIC, and multi-node ownership.
 
-## 功能概览
+## 1. 项目介绍 / Project Overview
 
-| 能力 | 实现 |
-|---|---|
-| 实时传输 | QUIC bidirectional stream，TLS 1.3，ALPN `collab-editor-v1` |
-| 消息边界 | 4-byte big-endian length + JSON payload |
-| 协作并发 | 每个文档一个 Room goroutine，event channel 串行处理 |
-| 冲突处理 | Version + OT-lite，支持 Insert/Delete 四类变换 |
-| 权限 | `owner / write / read`，动态降级立即生效 |
-| 身份认证 | JWT Access Token + Redis Session，AUTH 消息不携带 user_id |
-| 持久化 | MySQL Document、Permission、Operation Log、Snapshot |
-| 恢复 | Snapshot + Operation Log Replay、RESUME/SYNC/RESYNC_REQUIRED |
-| 幂等 | 相同 `request_id` 返回首次成功的 `edit_applied` |
-| 客户端可靠性 | 状态机、自动重连、SQLite Pending/文档状态、进程崩溃恢复 |
-| 凭据安全 | OS Keychain / Credential Manager / Secret Service，不在 SQLite 保存 Token |
-| 慢客户端 | 有界发送队列 + 非阻塞 `TrySend`，队列满时安全断开 |
+### 中文
 
-## 架构
+本项目实现了一个面向代码与纯文本场景的实时协作编辑后端，并提供可恢复的 CLI 客户端。客户端通过 REST 完成注册、登录、文档和权限管理，通过 QUIC 可靠有序 Stream 发送实时编辑消息。服务端使用 Operational Transformation（OT）处理并发 Insert/Delete，以单文档单 Room goroutine 串行维护内存状态，并在 MySQL 事务中持久化文档、权限、Operation Log、Snapshot 和 Fencing Token。
 
-```mermaid
-flowchart LR
-    C1[QUIC Client A] -->|UDP / TLS 1.3| QS[QUIC Server]
-    C2[QUIC Client B] -->|UDP / TLS 1.3| QS
-    QS --> AUTH[JWT + Redis Session]
-    QS --> TC[QUIC Transport Client]
-    TC --> TI[transport.Client]
-    TI --> RM[RoomManager]
-    RM --> R["Document Room<br/>single goroutine"]
-    R --> OT[Version + OT]
-    R --> P[Permission]
-    R --> S[storage.Store]
-    S --> M[(MySQL)]
-    HTTP[REST API / TCP :8080] --> RM
-    HTTP --> S
-```
+选择 QUIC 是为了在 UDP 之上获得 TLS 1.3、可靠有序 Stream、连接级超时与后续扩展空间，同时让实时传输与 REST 控制面保持独立。多节点架构用于避免单节点成为长期可用性瓶颈：etcd 负责 Membership 和 Lease-backed Ownership，Rendezvous Hashing 只选择优先候选节点，MySQL Fencing Token 最终阻止旧 Owner 继续写入。
 
-Room 只依赖以下接口，不引用 QUIC、UDP、TLS 或 Stream 类型：
+主要技术包括 Go、QUIC、MySQL、Redis、etcd、SQLite、JWT、mTLS、Prometheus 和 OpenTelemetry。当前后端、CLI 恢复链路、多节点接管和真实依赖集成测试已经完成；Docker 与 Google Cloud Terraform 配置已经准备，但尚未执行云端部署，也没有图形化前端。
 
-```go
-type Client interface {
-    Identity() string
-    TrySend(protocol.Message) bool
-    Close(error)
-}
-```
+### English
 
-QUIC Client 与测试用 channel Client 都实现该接口。实时传输替换没有复制 Room、OT、权限或持久化业务逻辑。
+This project implements a real-time collaborative editing backend for code and plain text, together with a recoverable CLI client. Clients use REST for registration, authentication, document management, and permissions, while real-time edits travel over reliable ordered QUIC streams. The server resolves concurrent Insert/Delete operations with Operational Transformation (OT), keeps each document's in-memory state inside one Room goroutine, and persists documents, permissions, operation logs, snapshots, and fencing tokens through MySQL transactions.
 
-## Room 与事件顺序
+QUIC provides TLS 1.3, reliable ordered streams, connection-level timeouts, and room for transport evolution over UDP, while keeping the real-time data plane separate from the REST control plane. The multi-node design removes the long-term availability dependency on a single process: etcd manages membership and lease-backed ownership, Rendezvous Hashing selects only the preferred candidate, and MySQL fencing tokens ultimately prevent stale owners from writing.
 
-```text
-QUIC ReadLoop
-  -> Room.events
-  -> Room goroutine
-       Join / Resume / Edit / Leave / Permission Change / Snapshot Result
-  -> Client.TrySend
-  -> QUIC WriteLoop
-```
+The main stack is Go, QUIC, MySQL, Redis, etcd, SQLite, JWT, mTLS, Prometheus, and OpenTelemetry. The backend, CLI recovery path, multi-node failover, and real-dependency integration tests are implemented. Docker and Google Cloud Terraform assets are prepared, but no cloud deployment has been performed and no graphical frontend is included.
 
-- Room goroutine 是 `content/version/history/permissions/clients` 的唯一写入者。
-- Permission Change 和 Edit 通过同一队列确定顺序。
-- Resume 初始同步先进入发送队列，再注册实时广播，避免同步与后续编辑之间的消息缺口。
-- `TrySend` 使用容量 32 的有界 channel，立即成功或立即失败，不阻塞 Room。
+## 2. 核心功能 / Key Features
 
-## QUIC 连接生命周期
+| 功能 | Feature | 技术实现 / Implementation |
+| --- | --- | --- |
+| 实时通信 | Real-time Communication | QUIC reliable bidirectional stream、TLS 1.3、ALPN、length-prefixed JSON |
+| 协作编辑 | Collaborative Editing | Versioned Operational Transformation，支持 Insert/Delete |
+| 节点发现 | Node Discovery | etcd Membership、Lease、Watch |
+| 节点选择 | Node Selection | Rendezvous Hashing，仅选择优先候选节点 / preferred candidate only |
+| 所有权管理 | Ownership | etcd Lease + Transaction + ACTIVE/RECOVERING state |
+| 写入保护 | Write Protection | MySQL Fencing Token，在事务内校验 NodeID 与 Token |
+| 数据持久化 | Persistence | MySQL Document、Permission、Operation Log、Snapshot |
+| Session 与在线状态 | Session & Presence | Redis Session、Operation Lease、Presence TTL、Pub/Sub reconciliation |
+| 本地恢复 | Local Recovery | SQLite document state、Pending Edit、refresh-attempt transaction |
+| 身份认证 | Authentication | JWT Access Token + Refresh Token Rotation + encrypted replay |
+| 内部通信 | Internal Communication | mTLS、证书 NodeID/Incarnation 绑定、Membership revalidation |
+| 权限模型 | Authorization | `owner / write / read`，动态变更立即生效 |
+| 慢客户端保护 | Slow-client Protection | 有界发送队列、非阻塞广播、自动移除慢连接 |
+| 可观测性 | Observability | Prometheus metrics、OpenTelemetry tracing、structured redacted logs |
+| 优雅关闭 | Graceful Shutdown | Context、SIGINT/SIGTERM、Room/QUIC/HTTP dependency-ordered shutdown |
 
-第一版采用一个 QUIC Connection、一个 bidirectional Stream、一个协作文档：
-
-```text
-TLS 1.3 handshake (ALPN collab-editor-v1)
-  -> client opens one bidirectional stream
-  -> AUTH(access token)
-  -> JWT signature/claims validation
-  -> Redis Session + user status validation
-  -> AUTH_OK
-  -> JOIN or RESUME
-  -> Room collaboration
-```
-
-服务端禁用 QUIC Datagram；编辑只使用可靠、有序 Stream。每个连接只有一个 WriteLoop 写 Stream。ReadLoop 负责 framing、JSON 严格解码、Session Lease 和 Room 调用，不直接修改 Room 状态。
-
-连接关闭、异常、Logout 或服务退出都会执行 Room Leave、注销活动 Session Connection、关闭 Stream/Connection，并等待相关 goroutine 退出。
-
-## 客户端连接状态与自动恢复
-
-`cmd/quic-client` 使用单一 supervisor 管理连接，任何时刻最多存在一个 Dial/Reconnect Loop 和一个有效 QUIC Connection：
-
-```text
-DISCONNECTED -> CONNECTING -> AUTHENTICATING -> SYNCING -> CONNECTED
-                                      network error |
-                                                    v
-RECONNECTING -> [REFRESHING_TOKEN when needed] -> CONNECTING
-
-any state -> CLOSED (exit / context cancellation)
-```
-
-- 首次连接发送 `AUTH -> JOIN`；断线重连创建全新的 QUIC Connection 和 bidirectional Stream，并发送 `AUTH -> RESUME(last_version)`。
-- 重连退避为 500ms、1s、2s、4s……，上限 30s，并加入 ±20% 随机抖动；成功恢复后重置计数。
-- `disconnect` 停止自动重连并释放旧连接；`reconnect` 显式恢复。进程退出后不会重新连接。
-- `status` 显示状态、文档、最后完整应用的 Server Version、认证/重连状态、重连次数、最近断线原因和 Pending Operations，但不显示任何 Token。
-- QUIC KeepAlive/IdleTimeout 继续负责传输层健康检查；Read/Write 错误上报 supervisor，不额外复制 QUIC 的可靠传输机制。
-
-### JWT 自动刷新
-
-客户端只解析 Access Token 的 `exp` 来安排提前约 60 秒刷新；签名、Claims、Redis Session 和用户状态仍完全由服务端验证。刷新调用现有 `POST /api/auth/refresh`，成功后在一个互斥临界区内同时替换 Access/Refresh Token，避免旧 Refresh Token 被并发轮换。
-
-Access Token 只保存在进程内存。Refresh Token 保存于操作系统原生安全凭据服务，不写入 SQLite、普通文件或日志。安全存储不可用时客户端明确失败，不会回退明文文件。
-
-刷新前，客户端先在 SQLite 保存稳定 `request_id`；服务端 Redis 使用该 ID 保存 10 分钟的加密 Rotation Replay Record。若响应丢失或进程在请求中崩溃，客户端用原 Token 和原 ID 重试，服务端返回同一个新 Refresh Token。新 Token 先写 OS 安全存储，随后才清理 SQLite attempt。
-
-### RESUME 与 Pending Edit
-
-客户端只在按顺序成功应用完整 Operation 后推进 `last_version`：
-
-```text
-SYNC: verify from_version -> verify every version is contiguous
-      -> apply operations -> verify to_version -> commit local state
-
-RESYNC_REQUIRED: replace with snapshot -> verify/apply contiguous suffix
-                 -> verify current_version -> commit local state
-```
-
-恢复校验失败时不会进入 `CONNECTED`。EDIT 发送前先以 `synchronous=FULL` 事务保存 `request_id/doc_id/base_version/operation`；只有 SQLite COMMIT 成功后才允许发送。断线或进程重启后按创建顺序恢复 Pending，并在 RESUME 后使用原 `request_id` 重试。
-
-收到 `edit_applied` 后，文档 Content/Version 更新和 Pending 删除在同一个 SQLite 事务提交。历史幂等 ACK 不会重复应用内容；Version 缺口会触发重新连接和 RESUME。若服务端 History 已裁剪且未提交 Pending 无法转换，该 Pending 保留为冲突状态，等待人工处理。
-
-CLI 没有 Optimistic UI 或独立本地编辑缓冲区，因此本阶段没有虚构完整 Optimistic Rebase。CLI 会串行发送 Pending Edit，并让现有服务端 OT 依据其原始 `base_version` 变换；真正编辑器集成后的本地光标、未提交视图和多操作 rebase 仍是后续扩展。
-
-## 客户端 SQLite 与 Profile
-
-默认数据库位于操作系统用户配置目录，而不是 Git 仓库：
-
-- macOS：`~/Library/Application Support/collab-editor/profiles/<profile>/state.db`
-- Linux：`~/.config/collab-editor/profiles/<profile>/state.db`
-- Windows：由 `os.UserConfigDir()` 选择系统配置目录
-
-可用 `COLLAB_CLIENT_STATE_DIR` 改变根目录，使用 `COLLAB_CLIENT_PROFILE` 或 `-profile` 隔离用户。相同 Profile 由 OS advisory lock 保证只有一个写进程；不同 Profile 可以同时运行。数据库启动时执行 Migration 和 `PRAGMA quick_check`，损坏时保留原文件并拒绝启动。
+## 3. 系统架构 / System Architecture
 
 ```mermaid
-erDiagram
-    CLIENT_DOCUMENTS {
-        text doc_id PK
-        integer server_version
-        text content
-        text updated_at
-    }
-    PENDING_EDITS {
-        integer id PK
-        text doc_id
-        text request_id UK
-        integer base_version
-        text operation_json
-        text status
-        integer retry_count
-    }
-    REFRESH_ATTEMPTS {
-        text request_id PK
-        text status
-        text created_at
-        text updated_at
-    }
+flowchart TB
+    Client[CLI Client]
+    REST[REST API]
+    QUIC[QUIC Transport<br/>UDP + TLS 1.3]
+    Keyring[OS Keyring]
+    SQLite[(Client SQLite)]
+    Obs[Prometheus + OpenTelemetry]
+
+    subgraph Cluster[Application Nodes]
+        Nodes[Node A / Node B / Node C<br/>REST + QUIC]
+        RM[Per-node Room Manager]
+        Room[Owned Document Room<br/>single goroutine]
+        OT[Versioned OT]
+    end
+
+    Etcd[(etcd<br/>Membership + Ownership)]
+    MySQL[(MySQL<br/>Documents + Logs + Snapshots)]
+    Redis[(Redis<br/>Sessions + Presence)]
+
+    Client --> REST
+    Client --> QUIC
+    Client --> SQLite
+    Client --> Keyring
+    REST --> Nodes
+    QUIC --> Nodes
+    Nodes --> RM
+    RM --> Room
+    Room --> OT
+    Nodes <--> Etcd
+    Room --> MySQL
+    Nodes --> Redis
+    Nodes --> Obs
 ```
 
-SQLite 启用 WAL、Foreign Keys、5 秒 Busy Timeout 和 `synchronous=FULL`。表中不存在 Access Token 或 Refresh Token 字段。
+### 中文
 
-## Refresh Rotation 幂等与加密
+REST API 是认证、文档与权限管理的控制面；QUIC Transport 是实时编辑数据面。QUIC 客户端可以连接任意节点，节点根据 etcd 中的 Owner 信息处理请求或返回经过认证的 Owner Redirect。Owner-sensitive Permission 写入到达非 Owner 节点时，会通过内部 mTLS 转发到 Owner 节点重新鉴权并执行。每个应用节点拥有独立的 Room Manager，用于创建、恢复和回收本节点持有 Ownership 的文档 Room；Room 只依赖 Transport 与 Storage 接口，不直接依赖 QUIC 或 SQL。MySQL 是文档和最终写入校验的权威来源，etcd 是节点与在线 Ownership 的权威来源，Redis 只管理 Session、Operation Lease、Presence 和跨节点撤销通知。客户端将文档版本与 Pending Edit 保存在 SQLite，将 Refresh Token 保存在 OS Keyring。
 
-Redis Lua 在一个原子操作内验证 Session/current hash，轮换 hash，并按 `session_id + request_id` 保存短期 Replay Record：
+### English
+
+The REST API is the control plane for authentication, documents, and permissions; QUIC is the real-time editing data plane. A QUIC client may connect to any node, which either serves the document or returns an authenticated owner redirect based on etcd ownership. When an owner-sensitive permission write reaches a non-owner node, the node forwards it over internal mTLS so the owner can reauthenticate and execute it. Each application node has its own Room Manager, which creates, recovers, and retires Rooms owned by that node. A Room depends only on transport and storage interfaces, not directly on QUIC or SQL. MySQL is authoritative for documents and final write validation, etcd is authoritative for live nodes and ownership, and Redis is limited to sessions, operation leases, presence, and cross-node revocation. The client stores document versions and pending edits in SQLite, while refresh tokens remain in the OS keyring.
+
+## 4. 核心设计 / Core Design
+
+### 4.1 多节点路由 / Multi-node Routing
+
+**中文：** 目的：允许 QUIC 客户端从任意节点进入，并让 Permission 写入到达文档 Owner。技术：etcd Membership、OwnerResolver、Permission mTLS forwarding 和 QUIC `owner_redirect`。流程：入口节点解析 Owner；本节点为 Owner 时进入 Room，否则 Permission 写入通过 mTLS 转发，QUIC 客户端验证 Redirect 后重连。原因：路由信息与写入权必须分离。保证：Endpoint 只能来自可信 Membership，非法地址、Redirect loop 和不可达 Owner 都会 fail closed，不回退到本地写入。
+
+**English:** Purpose: allow QUIC clients to enter through any node and route permission writes to the document owner. Technology: etcd membership, `OwnerResolver`, mTLS permission forwarding, and QUIC `owner_redirect`. Flow: the entry node resolves the owner; a local owner enters the Room path, otherwise permission writes are forwarded over mTLS and the QUIC client validates the redirect before reconnecting. Rationale: routing information must remain separate from write authority. Guarantees: endpoints come only from trusted membership; invalid targets, redirect loops, and unavailable owners fail closed without local-write fallback.
+
+### 4.2 一致性节点选择 / Rendezvous Hashing
+
+**中文：** 目的：为无 Owner 文档选择稳定的优先节点。技术：对 Doc ID 与 READY Node Identity 进行 Rendezvous Hashing 排序。流程：节点集合变化时重新计算候选顺序，但健康 Room 不主动迁移。原因：减少节点加入或退出造成的映射变化。保证：Hash 排名不授予写入权，最终 Ownership 仍必须经过 etcd Transaction。
+
+**English:** Purpose: select a stable preferred node for a document without an owner. Technology: Rendezvous Hashing over the document ID and READY node identities. Flow: membership changes update candidate ranking, but healthy Rooms are not migrated proactively. Rationale: minimize remapping when nodes join or leave. Guarantees: hash ranking never grants write authority; ownership still requires an etcd transaction.
+
+### 4.3 文档所有权管理 / Room Ownership
+
+**中文：** 目的：任一时刻只允许一个权威 Room。技术：etcd Lease、Transaction、Watch，以及 `RECOVERING → ACTIVE` 状态。流程：候选节点原子获取 Ownership，激活更高 Fencing Token，从 Snapshot + Operation Log 恢复并校验文档后才标记 ACTIVE。原因：etcd 适合管理短期在线所有权，MySQL 适合保存长期状态。保证：Lease 丢失触发 Self-Fencing；恢复失败的节点不会对外提供 Active Room。
+
+**English:** Purpose: keep exactly one authoritative Room at a time. Technology: etcd leases, transactions, watches, and `RECOVERING → ACTIVE` ownership states. Flow: a candidate atomically acquires ownership, activates a higher fencing token, restores and validates the document from snapshot plus operation log, and only then becomes ACTIVE. Rationale: etcd manages ephemeral live ownership while MySQL preserves durable state. Guarantees: lease loss triggers self-fencing, and failed recovery never exposes an active Room.
+
+### 4.4 写入隔离机制 / Fencing Token
+
+**中文：** 目的：阻止网络分区中的旧 Owner 继续写入。技术：单调递增的 `WriteAuthority{NodeID, FencingToken}` 和 MySQL 行锁事务。流程：新 Owner 先在 MySQL 激活更高 Token；Edit、Permission、Snapshot 与恢复基线写入都在同一事务中校验 NodeID 和 Token。原因：etcd 与 MySQL 无法原子提交，最终写入校验必须放在持久化事务内部。保证：新 Token 激活后，旧 Token 的所有写入都返回 Fenced/Service Unavailable，不能产生广播或内存分叉。
+
+**English:** Purpose: prevent a stale owner in a network partition from continuing to write. Technology: monotonic `WriteAuthority{NodeID, FencingToken}` values and row-locked MySQL transactions. Flow: a new owner activates a higher token in MySQL; edits, permissions, snapshots, and recovery baselines validate node ID and token in the same transaction as the write. Rationale: etcd and MySQL cannot commit atomically, so final authorization belongs inside the durable transaction. Guarantees: after a higher token is activated, every stale-token write is rejected before broadcast or in-memory mutation.
+
+### 4.5 协作编辑 / Collaborative Editing
+
+**中文：** 目的：在并发编辑下保持所有客户端内容与版本一致。技术：单 Room goroutine、Versioned OT 和持久化 Operation Log。流程：Room 串行处理权限、Version、OT Transform、`CommitEdit`、内存更新和广播；数据库提交发生在广播之前。原因：单写入者模型让并发顺序明确，又不把传输层逻辑混入 OT。保证：支持 Insert/Insert、Insert/Delete、Delete/Insert、Delete/Delete；Version 连续、`request_id` 幂等，失败事务不会改变 Room 状态。
+
+**English:** Purpose: keep content and versions consistent under concurrent edits. Technology: one Room goroutine, versioned OT, and a durable operation log. Flow: the Room serializes permission checks, version handling, OT transformation, `CommitEdit`, in-memory mutation, and broadcast; the database commits before any broadcast. Rationale: a single-writer model makes ordering explicit without coupling OT to the transport. Guarantees: Insert/Insert, Insert/Delete, Delete/Insert, and Delete/Delete are supported; versions remain contiguous, `request_id` is idempotent, and failed transactions do not mutate Room state.
+
+### 4.6 快照与日志重放 / Snapshot + Replay
+
+**中文：** 目的：在 Room 重建时恢复状态并限制内存 History。技术：MySQL Snapshot、保存 OT 后实际 Operation 的追加日志和版本连续性校验。流程：加载最新 Snapshot，按 Version 重放后续 Operation，并与 documents 行的 Content/Version 比对；成功 Snapshot 才推进 History Floor。原因：Snapshot 缩短恢复路径，Operation Log 保留可验证的增量历史。保证：版本缺口或内容不一致会拒绝启动 Room；Snapshot 失败不会错误裁剪 History。
+
+**English:** Purpose: recover Room state while bounding in-memory history. Technology: MySQL snapshots, append-only logs of transformed operations, and version-continuity validation. Flow: load the latest snapshot, replay later operations in version order, and compare the result with the document row; the history floor advances only after a successful snapshot. Rationale: snapshots shorten recovery while operation logs retain verifiable incremental history. Guarantees: version gaps or content mismatches prevent Room activation, and snapshot failure never trims required history.
+
+### 4.7 跨节点会话撤销 / Session Revocation
+
+**中文：** 目的：Logout 或用户禁用后立即阻止旧 Session 继续操作。技术：Redis Session、Operation Lease、Pub/Sub、周期性 reconciliation 和 Connection Registry。流程：业务操作先获取 Lease；Logout 等待已开始的操作结束，撤销 Session 并发布事件，各节点关闭对应 QUIC Connection。原因：Pub/Sub 可能丢消息，因此不能作为唯一正确性机制。保证：每次认证使用都会重新验证 Session，周期性对账覆盖丢失通知，Redis 异常时 fail closed。
+
+**English:** Purpose: stop an old session after logout or user disablement. Technology: Redis sessions, operation leases, Pub/Sub, periodic reconciliation, and a connection registry. Flow: operations acquire a lease; logout waits for already-started work, revokes the session, publishes an event, and each node closes matching QUIC connections. Rationale: Pub/Sub may lose messages and cannot be the sole correctness mechanism. Guarantees: authenticated use revalidates the session, reconciliation covers missed notifications, and Redis failures fail closed.
+
+### 4.8 客户端故障恢复 / Client Recovery
+
+**中文：** 目的：在断网、进程崩溃或 Owner 切换后恢复编辑且不重复提交。技术：连接状态机、指数退避、JWT Refresh、`RESUME/SYNC/RESYNC_REQUIRED`、SQLite Pending 和 OS Keyring。流程：Edit 先以原始 `request_id` 提交到 SQLite，再发送；重连后完成认证与版本同步，然后按顺序重试 Pending。原因：本地持久化必须先于网络发送，Refresh Token 不应落入普通文件。保证：同一时刻只有一个 Reconnect Loop；ACK 与 Pending 删除原子提交，Token Rotation 使用稳定请求 ID 和加密 Replay Record。
+
+**English:** Purpose: recover from network loss, process crashes, or owner changes without duplicate edits. Technology: a connection state machine, exponential backoff, JWT refresh, `RESUME/SYNC/RESYNC_REQUIRED`, SQLite pending state, and the OS keyring. Flow: an edit is committed to SQLite with its original `request_id` before transmission; after reconnecting, the client authenticates, synchronizes versions, and retries pending edits in order. Rationale: local durability must precede network send, and refresh tokens should not be stored in ordinary files. Guarantees: only one reconnect loop runs at a time; acknowledgement and pending deletion commit atomically, while token rotation uses a stable request ID and encrypted replay record.
+
+## 5. 技术栈 / Technology Stack
+
+版本均来自当前仓库配置。 / Versions below are read from the current repository configuration.
+
+| 类别 / Category | 技术 / Technology | 当前版本或约束 / Version or Constraint |
+| --- | --- | --- |
+| 语言 / Language | Go | language `1.26.0`, toolchain `1.26.10` |
+| HTTP | Go `net/http` | standard library |
+| 实时传输 / Realtime Transport | `quic-go` | `v0.49.1`, TLS 1.3 |
+| 数据库 / Database | MySQL | local `8.4.13`; Cloud SQL target `MYSQL_8_4` |
+| Session / Presence | Redis | local `7.4.5`; Memorystore target `REDIS_7_2` |
+| 集群协调 / Coordination | etcd | `3.5.17` |
+| 客户端存储 / Client Storage | `modernc.org/sqlite` | `v1.34.5` |
+| JWT | `golang-jwt/jwt/v5` | `v5.2.2` |
+| Metrics | Prometheus Go Client | `v1.20.5` |
+| Tracing | OpenTelemetry | core/sdk/exporter `v1.45.0`, HTTP instrumentation `v0.61.0` |
+| Infrastructure as Code | Terraform | `>= 1.8.0, < 2.0.0`; audited with `1.17.1` |
+| Terraform Providers | Google / Random | `8.10.0` / `3.9.0` |
+| Container Images | MySQL / Redis / etcd | `8.4.13` / `7.4.5-alpine` / `3.5.17` |
+
+## 6. 项目结构 / Project Structure
 
 ```text
-old_refresh_hash
-new_refresh_hash
-AES-256-GCM encrypted new refresh token
-TTL (default 10m)
+cmd/                    # 可执行程序 / executables
+  server/               # REST、QUIC 与生命周期组合根 / service composition root
+  quic-client/          # 可恢复 CLI 客户端 / recoverable CLI client
+  migrate/              # MySQL Migration runner
+  admin/                # 管理工具 / administrative utility
+  loadtest/             # REST + QUIC 压测工具 / load generator
+  healthcheck/          # 容器健康检查 / container health probe
+internal/
+  api/                  # REST、认证中间件、跨节点 mTLS forwarding
+  authentication/       # JWT、Redis Session、Rotation、Presence、Revocation
+  client/               # 重连、Redirect、Resume、Pending recovery
+  cluster/              # Membership、Rendezvous、Ownership interfaces
+    etcd/                # etcd Registry、Lease、Ownership、Failover
+    rpc/                 # 内部 mTLS RPC / internal mTLS RPC
+  collab/               # 文档 Operation 与 OT
+  config/               # 环境配置与安全校验 / configuration validation
+  migration/            # 有序、可恢复 Migration runner
+  observability/        # Logs、metrics、tracing、health
+  protocol/             # REST/QUIC 消息与错误码 / messages and error codes
+  room/                 # 单 goroutine 文档状态机 / document state machine
+  storage/              # Storage contracts、Memory、Replay
+    mysql/               # MySQL transaction and fencing implementation
+  transport/            # Transport interface
+    quic/                # QUIC framing、client、server、connection lifecycle
+migrations/             # MySQL schema migrations
+deploy/gcp/              # Google Cloud Terraform 与启动模板 / Terraform and startup templates
+docs/                    # 架构、运维、测试和部署报告 / architecture and operations docs
 ```
 
-AES-GCM Additional Authenticated Data 绑定 Session ID、Request ID、旧/新 Hash。密钥来自独立的 `REFRESH_REPLAY_ENCRYPTION_KEY`，不能复用 JWT Secret。Logout、Session 过期、Disabled User、不同 ID、错误旧 Token，以及 Session 已再次轮换时都拒绝旧 Replay。
+### 中文
 
-## Framing
+`internal/room` 不引用 QUIC 实现，`internal/storage` 不引用 etcd，集群协调、持久化和传输分别通过接口连接。`cmd/server` 是唯一负责创建依赖并按顺序关闭资源的组合根。
 
-QUIC Stream 是字节流，每条消息编码为：
+### English
 
-```text
-4-byte unsigned big-endian payload length
-JSON payload
-```
+`internal/room` does not import the QUIC implementation, and `internal/storage` does not depend on etcd. Cluster coordination, persistence, and transport meet through explicit interfaces. `cmd/server` is the composition root that creates dependencies and shuts them down in order.
 
-默认最大 payload 为 1 MiB。长度为 0、超过上限、半包 EOF 均被拒绝；`io.ReadFull` 处理半包与连续消息，`writeAll` 处理短写。Malformed JSON 返回 `BAD_MESSAGE`，连接仍可继续使用；非法长度和超大 frame 会关闭连接。
+## 7. 快速开始 / Getting Started
 
-## Version + OT
+### 环境要求 / Prerequisites
 
-客户端 EDIT 必须携带 `base_version`：
+中文：需要 Go 1.26.10+、Docker、Docker Compose 和 OpenSSL。运行客户端还需要系统凭据服务（macOS Keychain、Windows Credential Manager 或 Linux Secret Service）。
+English: Go 1.26.10+, Docker, Docker Compose, and OpenSSL are required. The client also needs the platform credential service: macOS Keychain, Windows Credential Manager, or Linux Secret Service.
 
-```text
-base_version == current_version -> 直接应用
-history_floor <= base_version < current_version -> 对后续实际 Operation 逐条 Transform
-base_version < history_floor -> RESYNC_REQUIRED
-base_version > current_version -> VERSION_AHEAD
-```
+### 环境配置 / Environment Configuration
 
-支持 Insert/Insert、Insert/Delete、Delete/Insert、Delete/Delete。Position 和 Length 使用 Unicode rune offset。同位置 Insert 按 Room 服务端处理顺序确定结果。
-
-## MySQL 事务与恢复
-
-编辑事务：
-
-```text
-Permission + Version + OT
-  -> SELECT document FOR UPDATE
-  -> check persisted version and request_id
-  -> UPDATE documents
-  -> INSERT operation_logs (transformed operation)
-  -> COMMIT
-  -> update Room
-  -> broadcast edit_applied
-```
-
-创建文档时，Document、Owner Permission、Version 0 Snapshot 在同一事务提交。默认每 100 次成功编辑异步保存 Snapshot；成功结果回到 Room event queue 后推进 History Floor 并裁剪内存 History。Snapshot 失败不回滚编辑、不裁剪 History，并自动重试；History 达到硬上限时返回 `SERVICE_UNAVAILABLE`。
-
-Room 重建流程：
-
-```text
-Latest Snapshot
-  -> Operations after Snapshot Version
-  -> verify contiguous versions
-  -> replay persisted transformed operations without OT
-  -> verify replayed content/version == documents row
-  -> load permissions and start Room
-```
-
-没有 Snapshot 的旧文档会在行锁事务内创建当前状态的 Baseline Snapshot，不修改文档 Version，不删除旧 Operation Log。
-
-## 身份与权限
-
-| Role | Read | Edit | Change Permission |
-|---|---:|---:|---:|
-| owner | ✅ | ✅ | ✅ |
-| write | ✅ | ✅ | ❌ |
-| read | ✅ | ❌ | ❌ |
-
-QUIC AUTH 只接受 JWT Access Token，不接受 user_id。每条业务消息持有 Session Lease；Logout 等待已开始的 EDIT 完成，再删除 Session 并通过 Connection Registry 关闭活动 QUIC 连接。Disabled 用户的已有 Access/Refresh Session 同样失效。
-
-## 协议
-
-AUTH：
-
-```json
-{"type":"auth","token":"ACCESS_TOKEN"}
-```
-
-成功响应：
-
-```json
-{"type":"auth_ok"}
-```
-
-交互 CLI 自动完成 AUTH，用户输入从 JOIN 或 RESUME 开始。
-
-JOIN：
-
-```json
-{"type":"join","doc_id":"main.go"}
-```
-
-```json
-{"type":"joined","doc_id":"main.go","version":0,"content":"abcdef","role":"owner"}
-```
-
-EDIT：
-
-```json
-{"type":"edit","request_id":"op-1","doc_id":"main.go","base_version":0,"operation":{"kind":"insert","position":2,"text":"X"}}
-```
-
-```json
-{"type":"edit_applied","request_id":"op-1","doc_id":"main.go","version":1,"operation":{"kind":"insert","position":2,"text":"X"}}
-```
-
-RESUME：
-
-```json
-{"type":"resume","doc_id":"main.go","last_version":230}
-```
-
-增量恢复：
-
-```json
-{"type":"sync","doc_id":"main.go","from_version":230,"to_version":231,"operations":[{"version":231,"operation":{"kind":"insert","position":2,"text":"X"}}]}
-```
-
-完整恢复：
-
-```json
-{"type":"resync_required","doc_id":"main.go","snapshot":{"version":200,"content":"complete content"},"operations":[],"current_version":200}
-```
-
-主要错误码：`BAD_MESSAGE`、`PERMISSION_DENIED`、`VERSION_AHEAD`、`VERSION_CONFLICT`、`DUPLICATE_REQUEST`、`INVALID_OPERATION`、`RESYNC_REQUIRED`、`SERVICE_UNAVAILABLE`、`INTERNAL_ERROR`。
-
-## 配置与启动
-
-要求：Go 1.26.10+、Docker、有效的 TLS 证书。`go.mod` 和生产构建均固定使用 Go 1.26.10；QUIC 使用固定依赖 `github.com/quic-go/quic-go v0.49.1`。这些版本包含当前漏洞审计要求的标准库、TLS 和 QUIC 安全修复。
-
-创建配置：
+复制示例配置并替换所有密码与密钥占位符。生产 Secret、`.env` 和证书私钥不得提交。
+Copy the example configuration and replace every password and key placeholder. Never commit production secrets, `.env`, or certificate private keys.
 
 ```bash
 cp .env.example .env
 ```
 
-开发环境可用 OpenSSL 创建本地 CA 和 localhost 证书：
+为本地 QUIC 服务创建只用于开发的 CA 和 localhost 证书。
+Create a development-only CA and localhost certificate for the local QUIC server.
 
 ```bash
 mkdir -p certs
@@ -324,9 +227,10 @@ openssl x509 -req -days 365 -in certs/server.csr \
   -out certs/server.crt -extfile certs/server.ext
 ```
 
-证书私钥和 `.env` 不应提交。
+### 启动基础设施与初始化数据库 / Infrastructure and Database Initialization
 
-启动依赖、Migration 和服务：
+Compose 启动 MySQL 8.4.13 与 Redis 7.4.5；Migration 命令创建并校验 Schema。
+Compose starts MySQL 8.4.13 and Redis 7.4.5; the migration command creates and validates the schema.
 
 ```bash
 docker compose up -d --wait
@@ -334,344 +238,162 @@ set -a
 source .env
 set +a
 go run ./cmd/migrate
+```
+
+### 启动服务端 / Server Startup
+
+单节点开发模式仍使用完整 MySQL、Redis、JWT 和 QUIC 路径。REST 默认监听 TCP `:8080`，QUIC 默认监听 UDP `:8443`，管理端点默认只监听 `127.0.0.1:9090`。
+Single-node development mode still exercises MySQL, Redis, JWT, and QUIC. REST listens on TCP `:8080`, QUIC on UDP `:8443`, and management endpoints on `127.0.0.1:9090` by default.
+
+```bash
 go run ./cmd/server
 ```
 
-- REST：开发模式默认 HTTP/TCP `:8080`；生产模式强制 HTTPS
-- QUIC：UDP `:8443`
-- 生产客户端必须使用 `QUIC_CA_FILE` 验证服务端证书；代码拒绝 `InsecureSkipVerify`。
+### 创建用户并启动客户端 / Register and Start a Client
 
-生产 REST TLS 配置：
-
-```text
-APP_ENV=production
-REST_TLS_CERT_FILE=certs/rest-server.crt
-REST_TLS_KEY_FILE=certs/rest-server.key
-```
-
-生产模式缺少任一 REST TLS 文件、证书与私钥不匹配、证书过期或证书不允许
-Server Authentication 时，服务会拒绝启动，不会自动降级为 HTTP。开发模式只有在
-明确不配置这两个变量时才使用 HTTP。若以后由云负载均衡器终止 TLS，仍需显式设计
-可信代理网络边界；当前服务不会信任任意客户端提交的 `X-Forwarded-*` Header。
-
-主要 QUIC 配置：
-
-```text
-QUIC_ADDR=:8443
-QUIC_TLS_CERT_FILE=certs/server.crt
-QUIC_TLS_KEY_FILE=certs/server.key
-QUIC_CA_FILE=certs/ca.crt
-QUIC_HANDSHAKE_TIMEOUT=5s
-QUIC_IDLE_TIMEOUT=60s
-QUIC_KEEPALIVE_PERIOD=20s
-QUIC_AUTH_TIMEOUT=10s
-QUIC_READ_TIMEOUT=2m
-QUIC_WRITE_TIMEOUT=10s
-QUIC_OPERATION_TIMEOUT=10s
-QUIC_MAX_MESSAGE_SIZE=1048576
-QUIC_SEND_QUEUE_SIZE=32
-```
-
-多节点 Internal RPC 证书必须同时允许 Client/Server Authentication，并包含唯一的
-规范 URI SAN：
-
-```text
-spiffe://collab-editor/node/<node-id>/incarnation/<incarnation>
-```
-
-`NODE_ID` 与 `NODE_INCARNATION` 必须和 URI SAN 完全一致。生产集群要求显式配置
-`NODE_INCARNATION`，每次进程 Incarnation 变化都需要由外部 CA 签发匹配的新证书；
-项目当前没有内置 CA 或自动签发机制。内部 RPC 从已验证证书读取身份，不信任 HTTP
-Header 中声明的 NodeID 或 Incarnation，并继续要求该进程在 etcd Membership 中为
-`READY`。
-
-Snapshot 配置：
-
-```text
-SNAPSHOT_INTERVAL=100
-MAX_HISTORY_OPERATIONS=1000
-SNAPSHOT_TIMEOUT=5s
-```
-
-QUIC CLI 环境变量（Token 不应写入 `.env` 或提交到版本库）：
-
-```text
-COLLAB_QUIC_ADDR=localhost:8443
-COLLAB_API_URL=http://localhost:8080
-COLLAB_CA_FILE=certs/ca.crt
-COLLAB_SERVER_NAME=localhost
-COLLAB_ACCESS_TOKEN=...
-COLLAB_REFRESH_TOKEN=...
-COLLAB_CLIENT_PROFILE=user-a
-# COLLAB_CLIENT_STATE_DIR=/custom/config/root
-```
-
-首次初始化可以通过环境变量提供 Token。成功后 CLI 优先使用 OS 安全存储中的最新 Refresh Token，避免旧环境变量覆盖已轮换凭据。Token 不支持命令行参数，避免出现在 shell history 或进程列表。
-
-服务端 Refresh Replay 配置：
-
-```text
-REFRESH_REPLAY_TTL=10m
-REFRESH_REPLAY_ENCRYPTION_KEY=<base64 of exactly 32 random bytes>
-```
-
-生成独立密钥示例：`openssl rand -base64 32`。不要复用 `JWT_SECRET`，也不要提交真实密钥。
-
-## 认证与 REST API
-
-注册和登录：
+先通过 REST 注册并登录，从响应中取得 Access Token 和 Refresh Token；不要把真实 Token 写入仓库或 shell 脚本。
+Register and log in through REST, then obtain the access and refresh tokens from the response. Do not store real tokens in the repository or a shell script.
 
 ```bash
 curl -X POST http://localhost:8080/api/auth/register \
   -H 'Content-Type: application/json' \
-  -d '{"username":"user-a","password":"replace-this-password"}'
+  -d '{"username":"user-a","password":"StrongPassword123!"}'
 
 curl -X POST http://localhost:8080/api/auth/login \
   -H 'Content-Type: application/json' \
-  -d '{"username":"user-a","password":"replace-this-password"}'
+  -d '{"username":"user-a","password":"StrongPassword123!"}'
 ```
+
+首次运行可通过环境变量导入 Token；Refresh Token 成功导入后由 OS Keyring 管理。CLI 不接受 Token 命令行参数，以避免进入 shell history 或进程列表。
+Tokens may be imported through environment variables on first use; after import, the refresh token is managed by the OS keyring. The CLI deliberately has no token flags so credentials do not enter shell history or process listings.
 
 ```bash
-export ACCESS_TOKEN_A='login-response-access-token'
-export REFRESH_TOKEN_A='login-response-refresh-token'
-export USER_B_ID='user-b-id-from-auth-me'
-export USER_C_ID='user-c-id-from-auth-me'
+export COLLAB_ACCESS_TOKEN='<access-token>'
+export COLLAB_REFRESH_TOKEN='<refresh-token>'
+export COLLAB_CA_FILE='certs/ca.crt'
+go run ./cmd/quic-client -addr localhost:8443 -api http://localhost:8080 -profile user-a
 ```
 
-创建和读取文档：
-
-```bash
-curl -X POST http://localhost:8080/api/documents \
-  -H 'Content-Type: application/json' \
-  -H "Authorization: Bearer $ACCESS_TOKEN_A" \
-  -d '{"id":"main.go","content":"abcdef"}'
-
-curl http://localhost:8080/api/documents/main.go \
-  -H "Authorization: Bearer $ACCESS_TOKEN_A"
-```
-
-设置权限：
-
-```bash
-curl -X PUT "http://localhost:8080/api/documents/main.go/permissions/$USER_B_ID" \
-  -H 'Content-Type: application/json' \
-  -H "Authorization: Bearer $ACCESS_TOKEN_A" \
-  -d '{"role":"write"}'
-
-curl -X PUT "http://localhost:8080/api/documents/main.go/permissions/$USER_C_ID" \
-  -H 'Content-Type: application/json' \
-  -H "Authorization: Bearer $ACCESS_TOKEN_A" \
-  -d '{"role":"read"}'
-```
-
-## Demo 1–4：实时协作
-
-QUIC CLI 的标准输入一行是一条 JSON message，发送 JSON 时必须整条写在一行。
-
-Terminal A：
-
-```bash
-COLLAB_ACCESS_TOKEN="$ACCESS_TOKEN_A" \
-COLLAB_REFRESH_TOKEN="$REFRESH_TOKEN_A" \
-COLLAB_CLIENT_PROFILE=user-a \
-go run ./cmd/quic-client -addr localhost:8443 \
-  -api http://localhost:8080 -ca certs/ca.crt -server-name localhost
-```
-
-```json
-{"type":"join","doc_id":"main.go"}
-```
-
-Terminal B 使用 `$ACCESS_TOKEN_B` 启动相同命令，然后发送相同 JOIN。
-
-Demo 1，A 发送：
-
-```json
-{"type":"edit","request_id":"demo-1","doc_id":"main.go","base_version":0,"operation":{"kind":"insert","position":2,"text":"X"}}
-```
-
-A、B 均收到 Version 1，内容逻辑结果为 `abXcdef`。
-
-Demo 2，A 与 B 依次发送：
-
-```json
-{"type":"edit","request_id":"demo-2-a","doc_id":"main.go","base_version":1,"operation":{"kind":"insert","position":0,"text":"A"}}
-```
-
-```json
-{"type":"edit","request_id":"demo-2-b","doc_id":"main.go","base_version":1,"operation":{"kind":"insert","position":0,"text":"B"}}
-```
-
-B 的 Position 经 OT 从 0 变为 1，最终 `ABabXcdef`、Version 3。
-
-Demo 3，Terminal C 使用 `$ACCESS_TOKEN_C` 连接并发送：
-
-```json
-{"type":"join","doc_id":"main.go"}
-```
-
-Expected response（不需要输入）：`joined` 且 `role=read`。然后发送：
-
-```json
-{"type":"edit","request_id":"demo-3","doc_id":"main.go","base_version":3,"operation":{"kind":"insert","position":0,"text":"blocked"}}
-```
-
-Expected response：`PERMISSION_DENIED`。
-
-Demo 4，Owner 将 B 降级：
-
-```bash
-curl -X PUT "http://localhost:8080/api/documents/main.go/permissions/$USER_B_ID" \
-  -H 'Content-Type: application/json' \
-  -H "Authorization: Bearer $ACCESS_TOKEN_A" \
-  -d '{"role":"read"}'
-```
-
-B 收到 `permission_changed`。B 后续 EDIT 被拒绝，但连接保持；A 编辑后 B 仍收到 `edit_applied`。最终预期 `ABabXcdef!`、Version 4。
-
-## Demo 5：Snapshot + Resume + Resync
-
-临时设置并重启服务：
+客户端启动后可使用以下命令。 / Available interactive commands:
 
 ```text
-SNAPSHOT_INTERVAL=2
-MAX_HISTORY_OPERATIONS=10
-```
-
-在 `recovery.go` 上依次应用 A、B、C，使 Version 2 生成 Snapshot，当前 Version 为 3。停止并重新启动服务后，客户端直接发送 RESUME，不需要 JOIN：
-
-```json
-{"type":"resume","doc_id":"recovery.go","last_version":2}
-```
-
-Expected response：Version 3 Operation 的 `sync`。
-
-再开一个客户端发送：
-
-```json
-{"type":"resume","doc_id":"recovery.go","last_version":0}
-```
-
-Expected response：Version 2、Content `AB` 的 Snapshot，加上 Version 3 Insert `C`，`current_version=3`。REST GET 最终应为 `ABC/version=3`。
-
-## Demo 6：断线自动恢复
-
-先让 A、B 都使用上述 CLI 连接同一文档。CLI 命令也支持等价的一行协议 JSON：
-
-```text
-join main.go
-edit insert 0 A
+join DOC_ID
+edit insert POSITION TEXT
+edit delete POSITION LENGTH
 status
+pending
+reconnect
+disconnect
+exit
 ```
 
-临时阻断 A 到 UDP 8443 的网络，或停止服务；A 进入 `RECONNECTING`。保持 B 在线并执行：
+### 测试命令 / Test Commands
 
-```text
-edit insert 1 B
-```
-
-恢复网络/服务后，A 自动建立新 Connection/Stream、自动 AUTH、发送本地最后完整 Version 的 RESUME，应用 B 的 SYNC 后回到 `CONNECTED`。执行 `status` 应看到最新 Server Version、空 Pending 队列和已重置的重连次数。
-
-验证“编辑已提交但 ACK 丢失”时，在 A 发送编辑后立即中断其网络。A 保留该 Pending 的原 `request_id`；恢复后先 RESUME，再以相同 ID 重试。若 Operation 已在恢复数据中出现，旧 Version 的幂等 ACK 只确认并清理 Pending，不会再次应用；REST GET 的 Content 只包含一次该编辑，Version 只增加一次。
-
-## Demo 7：进程崩溃与 Refresh 响应丢失恢复
-
-用固定 Profile 启动并加入文档：
+以下命令用于基础质量检查；真实集成测试还需要下一节列出的环境变量。
+These commands run the base quality gates; real integration tests also require the environment variables described below.
 
 ```bash
-COLLAB_CLIENT_PROFILE=user-a \
-COLLAB_ACCESS_TOKEN="$ACCESS_TOKEN_A" \
-COLLAB_REFRESH_TOKEN="$REFRESH_TOKEN_A" \
-go run ./cmd/quic-client -ca certs/ca.crt
-```
-
-执行 `edit insert 0 X`，随后在服务端已提交但客户端尚未完成本地确认的窗口强制终止进程，例如测试环境中使用 `kill -9 <pid>`。重新执行相同启动命令（后续启动可省略 Refresh Token 环境变量）：
-
-```text
-SQLite load document + pending request_id
-  -> Keychain load refresh credential
-  -> AUTH
-  -> RESUME(last durable version)
-  -> retry original request_id
-  -> idempotent edit_applied
-  -> atomic SQLite document update + pending delete
-```
-
-使用 `pending` 确认队列最终为空，`status` 确认 Version，REST GET 确认 Content 只包含一次 `X`。
-
-模拟 Refresh 响应丢失时，保持 SQLite 中的 `refresh_attempts.request_id` 和 Keychain 中的旧 Token。重启后客户端发送相同 ID；Redis Replay Record 返回同一个加密保存的新 Refresh Token。Keychain 更新成功后客户端清理 attempt。若 Keychain 与 attempt 的 Rotation ID 冲突，客户端拒绝猜测并要求人工恢复。
-
-## 测试
-
-```bash
-gofmt -w .
+gofmt -l .
 go test -count=1 ./...
 go test -count=1 -race ./...
 go vet ./...
 go build ./...
 ```
 
-QUIC Demo 1–4 自动验收：
+## 8. 测试 / Testing
+
+### 中文
+
+- 单元测试覆盖 OT、Room 顺序、权限、协议、Framing、客户端状态机、配置和错误映射。
+- 集成测试使用真实 MySQL、Redis、etcd、TLS/mTLS、QUIC 和 SQLite，覆盖事务回滚、Fencing、Ownership 接管、跨节点 Logout、Snapshot + Replay、断线恢复和进程崩溃恢复。
+- Race Detector 在 package 并行执行条件下验证 Room、QUIC、Client、Session 与 Ownership 并发路径。
+- 未设置集成测试变量时，相关测试会明确 Skip；这种结果不能视为真实集成测试通过。变量包括 `MYSQL_TEST_DSN`、`REDIS_TEST_ADDR`、`REDIS_TEST_PASSWORD`、`ETCD_TEST_ENDPOINTS`、etcd TLS 文件，以及 `CLUSTER_TEST_*` 内部 mTLS 证书。
+- 完整隔离环境和无 Skip 的验收结果记录在 [Final Quality Gate](docs/operations/final-quality-gate.md) 与 [Phase 9.1 Audit](docs/operations/phase-9.1-pre-commit-audit.md)。
+
+### English
+
+- Unit tests cover OT, Room ordering, permissions, protocol handling, framing, the client state machine, configuration, and error mapping.
+- Integration tests use real MySQL, Redis, etcd, TLS/mTLS, QUIC, and SQLite to verify rollback, fencing, ownership takeover, cross-node logout, snapshot plus replay, reconnect, and process-crash recovery.
+- The Race Detector exercises concurrent Room, QUIC, Client, Session, and Ownership paths with package-level parallelism enabled.
+- Integration tests explicitly skip when their environment variables are absent; a skipped result is not treated as real-infrastructure validation. Required values include `MYSQL_TEST_DSN`, `REDIS_TEST_ADDR`, `REDIS_TEST_PASSWORD`, `ETCD_TEST_ENDPOINTS`, etcd TLS files, and the `CLUSTER_TEST_*` internal mTLS certificates.
+- The isolated, no-skip validation procedure and results are documented in [Final Quality Gate](docs/operations/final-quality-gate.md) and [Phase 9.1 Audit](docs/operations/phase-9.1-pre-commit-audit.md).
+
+### 受控多节点测试数据 / Controlled Multi-node Results
+
+以下结果来自 Apple M4 开发机上的小规模突发测试，不是生产容量、SLA 或长期稳定性声明。
+These results come from a small controlled burst test on an Apple M4 development machine. They are not production capacity, SLA, or soak-test claims.
+
+| 节点 / Nodes | 客户端 / Clients | 文档 / Documents | Applied Edits | Errors | RPS | P95 |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 4 | 2 | 40 | 0 | 241.3 | 24.6 ms |
+| 3 | 9 | 6 | 135 | 0 | 491.5 | 29.9 ms |
+| 5 | 15 | 10 | 300 | 0 | 660.0 | 29.8 ms |
+
+详细条件、故障注入矩阵和限制见 [Phase 8.9 Load Test](docs/performance/phase-8.9-load-test.md)。
+See [Phase 8.9 Load Test](docs/performance/phase-8.9-load-test.md) for conditions, fault injection, and limitations.
+
+## 9. 部署 / Deployment
+
+### 中文
+
+仓库包含多阶段 Dockerfile、非 Root 运行用户、Health Check、Compose 本地依赖，以及 Google Cloud Terraform。目标云架构使用三台 Compute Engine 应用节点、三节点 etcd、私网 Cloud SQL MySQL HA、Memorystore Redis、Secret Manager、Cloud NAT、内部 mTLS 和 Monitoring。Terraform 已完成 `fmt`、`validate` 和离线 `plan`，计划结果为 75 add / 0 change / 0 destroy。
+
+**基础设施已经准备，尚未执行部署。** 没有运行 `terraform apply`，没有创建 Google Cloud 收费资源。正式部署前仍需准备真实证书与 Secret、远程 State Bucket、预算、镜像扫描和回滚窗口。
+
+### English
+
+The repository includes a multi-stage Dockerfile, a non-root runtime user, health checks, Compose-based local dependencies, and Google Cloud Terraform. The target cloud architecture uses three Compute Engine application nodes, a three-member etcd cluster, private Cloud SQL MySQL HA, Memorystore Redis, Secret Manager, Cloud NAT, internal mTLS, and Monitoring. Terraform has passed `fmt`, `validate`, and an offline `plan` with 75 additions, 0 changes, and 0 deletions.
+
+**Infrastructure prepared, deployment not performed.** `terraform apply` has not been run and no paid Google Cloud resource has been created. Production deployment still requires real certificates and secrets, a protected remote state bucket, budget approval, image scanning, and a rollback window.
 
 ```bash
-go test -count=1 -run TestDemoAcceptance -v ./internal/transport/quic
+docker build -t collab-editor:local .
+
+terraform -chdir=deploy/gcp fmt -recursive -check
+terraform -chdir=deploy/gcp init
+terraform -chdir=deploy/gcp validate
+terraform -chdir=deploy/gcp plan -refresh=false
 ```
 
-真实 MySQL/Redis 集成测试：
+不要在未审核 Plan、预算和回滚方案时执行 Apply。
+Do not apply without an approved plan, budget, and rollback procedure.
 
-```bash
-MYSQL_TEST_DSN='collab:password@tcp(127.0.0.1:3306)/collab_editor?charset=utf8mb4&parseTime=true&loc=UTC' \
-REDIS_TEST_ADDR=127.0.0.1:6379 \
-REDIS_TEST_PASSWORD='password' \
-  go test -count=1 -v ./internal/authentication ./internal/migration ./internal/storage/mysql
-```
+## 10. 技术文档 / Documentation
 
-QUIC 集成测试会在 localhost 创建真实 UDP listener 和真实 TLS 1.3 连接，不使用 QUIC Mock；覆盖 ALPN、双向 Stream、AUTH、JOIN、EDIT、双客户端广播、Read 拦截、Logout、Session 撤销、异常关闭、Resume、Sync、Resync、Framing、超大消息和并发发送。`internal/client` 另外覆盖指数退避/抖动、单一重连循环、Token 单飞刷新与结果未知处理、SYNC 连续性、Pending ACK 丢失、真实 QUIC 服务中断/恢复和离线期间远端编辑。
+| 文档 / Document | 中文说明 | English Description |
+| --- | --- | --- |
+| [Final Code Review](docs/architecture/final-code-review.md) | Phase 1–9.0 架构边界、调用链和审查结论 | Architecture boundaries, call paths, and review findings |
+| [System Review](docs/architecture/phase-8.7-system-review.md) | 客户端恢复、多节点和持久化系统审查 | Client recovery, multi-node, and persistence review |
+| [Readability Refactoring](docs/architecture/readability-refactoring-report.md) | Clean Code 重构范围与兼容性说明 | Readability refactoring scope and compatibility notes |
+| [Final Quality Gate](docs/operations/final-quality-gate.md) | 真实依赖测试与最终质量 Gate | Real-dependency tests and final quality gates |
+| [Pre-Commit Audit](docs/operations/phase-9.1-pre-commit-audit.md) | Secret、依赖、许可证、Docker、Terraform 审计 | Secret, dependency, license, Docker, and Terraform audit |
+| [Production Readiness](docs/operations/phase-8.10-production-readiness.md) | 容器、安全、备份与恢复运行手册 | Container, security, backup, and recovery runbook |
+| [Observability](docs/operations/phase-8.8-observability.md) | Metrics、tracing、health 与日志约定 | Metrics, tracing, health, and logging conventions |
+| [Load Test](docs/performance/phase-8.9-load-test.md) | 多节点受控压测与故障注入结果 | Controlled multi-node load and failure results |
+| [Google Cloud Deployment](docs/deployment/phase-9.0-google-cloud-deployment.md) | GCP 架构、成本、部署和回滚设计 | GCP architecture, cost, deployment, and rollback design |
 
-## 项目结构
+## 11. 当前限制 / Current Limitations
 
-```text
-cmd/
-  admin/
-  healthcheck/
-  loadtest/
-  migrate/
-  quic-client/
-  server/
-internal/
-  api/
-  authentication/
-  client/
-    credential/
-    storage/
-  collab/
-  config/
-  cluster/
-  migration/
-  permission/
-  protocol/
-  room/
-  storage/
-    mysql/
-  transport/
-    client.go
-    quic/
-migrations/
-  001_initial.sql
-  002_users.sql
-  003_fencing_tokens.sql
-deploy/
-  gcp/
-```
+### 中文
 
-## 当前边界
+- 暂无图形化前端；当前客户端以 CLI、协议验证和恢复测试为主。
+- 一个 QUIC Connection 当前只承载一个文档和一个 bidirectional Stream；未启用 Datagram 或多文档 Stream multiplexing。
+- OT 是线性文本 OT-lite，不是完整 CRDT，也未实现图形化编辑器所需的 Optimistic UI、光标同步和本地多操作 Rebase。
+- MySQL Operation Log 仍为追加写入，尚未实现长期归档策略。
+- 第一版多节点部署采用稳定节点身份，不包含自动扩缩容、自动证书签发或健康 Room 主动迁移。
+- Google Cloud 尚未部署；Terraform 验证不能替代真实配额、IAM、证书、DNS 和网络验证。
+- Phase 8.9 是短时小规模测试，不代表生产峰值容量、跨区域延迟或长期内存稳定性。
+- 当前环境因 Docker Hub Token Endpoint 网络超时尚未完成最终镜像构建与镜像 CVE 扫描。
+- 仓库尚未选择公开分发许可证。
 
-- 已支持 etcd Membership、Rendezvous 优先节点选择、Lease/Transaction Ownership、MySQL Fencing、自动接管和 Owner Redirect；节点扩缩容仍采用受控的稳定节点身份，不会主动迁移健康 Room。
-- 一个 QUIC Connection 只承载一个文档和一个 bidirectional Stream。
-- 未使用 QUIC Datagram，不支持一个连接多文档或 Stream multiplexing。
-- OT 是线性文本 OT-lite，不是 CRDT 或完整生产级 OT。
-- CLI 已实现自动重连、Token 自动刷新、SQLite 进程崩溃恢复、严格 RESUME 和 Pending Edit 幂等恢复；完整 Optimistic Rebase 尚未实现，因为 CLI 没有真实本地编辑器缓冲区。
-- 本地 SQLite 只保护已提交事务；磁盘损坏、文件丢失或 OS 凭据服务不可用时不会自动猜测或删除状态。
-- MySQL Operation Log 保持追加写入，尚未归档。
-- Redis 已提供跨节点 Session 撤销、Operation Lease、Presence、Pub/Sub 重订阅和周期性对账；Redis 不是文档或 Ownership 的权威存储。
-- Google Cloud Terraform 仅完成格式化、校验和离线 Plan，没有执行 `terraform apply`。生产方案和边界见 [Phase 9.0 部署文档](docs/deployment/phase-9.0-google-cloud-deployment.md)，容器、备份与恢复见 [Phase 8.10 运维文档](docs/operations/phase-8.10-production-readiness.md)。
+### English
+
+- There is no graphical frontend; the current client focuses on CLI operation, protocol validation, and recovery testing.
+- One QUIC connection currently carries one document over one bidirectional stream; datagrams and multi-document stream multiplexing are not enabled.
+- OT is a linear-text OT-lite implementation, not a full CRDT. Optimistic UI, cursor synchronization, and editor-side multi-operation rebase are not implemented.
+- The MySQL operation log is append-only and does not yet have a long-term archival policy.
+- The initial multi-node deployment assumes stable node identities; it does not automate scaling, certificate issuance, or proactive migration of healthy Rooms.
+- Google Cloud has not been deployed. Terraform validation cannot replace real quota, IAM, certificate, DNS, and network verification.
+- Phase 8.9 was a short, small-scale test and does not establish production peak capacity, cross-region latency, or long-term memory stability.
+- The final container image build and image CVE scan remain unverified because the current environment cannot reach the Docker Hub token endpoint reliably.
+- The repository does not yet declare a public-distribution license.
