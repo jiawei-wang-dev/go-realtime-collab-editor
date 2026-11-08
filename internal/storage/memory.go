@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"sync"
+	"time"
 
 	"github.com/jiawei-wang-dev/go-realtime-collab-editor/internal/collab"
 	"github.com/jiawei-wang-dev/go-realtime-collab-editor/internal/permission"
@@ -17,6 +18,7 @@ type Memory struct {
 	requests    map[string]map[string]struct{}
 	snapshots   map[string]map[uint64]Snapshot
 	authorities map[string]WriteAuthority
+	updatedAt   map[string]time.Time
 }
 
 var _ Store = (*Memory)(nil)
@@ -29,6 +31,7 @@ func NewMemory() *Memory {
 		requests:    make(map[string]map[string]struct{}),
 		snapshots:   make(map[string]map[uint64]Snapshot),
 		authorities: make(map[string]WriteAuthority),
+		updatedAt:   make(map[string]time.Time),
 	}
 }
 
@@ -81,7 +84,51 @@ func (m *Memory) CreateDocument(ctx context.Context, id, content, ownerID string
 	m.permissions[id] = map[string]permission.Role{ownerID: permission.RoleOwner}
 	m.requests[id] = make(map[string]struct{})
 	m.snapshots[id] = map[uint64]Snapshot{0: {DocumentID: id, Version: 0, Content: content}}
+	m.updatedAt[id] = time.Now().UTC()
 	return document, nil
+}
+
+func (m *Memory) ListDocuments(ctx context.Context, userID string) ([]DocumentSummary, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	result := make([]DocumentSummary, 0)
+	for id, document := range m.documents {
+		if role := m.permissions[id][userID]; role.CanRead() {
+			result = append(result, DocumentSummary{ID: id, Version: document.Version, Role: role, UpdatedAt: m.updatedAt[id]})
+		}
+	}
+	return result, nil
+}
+
+func (m *Memory) DeleteDocument(ctx context.Context, commit DeleteDocumentCommit) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := ValidateWriteAuthority(commit.Authority); err != nil {
+		return err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, ok := m.documents[commit.DocumentID]; !ok {
+		return ErrNotFound
+	}
+	if m.authorities[commit.DocumentID] != commit.Authority {
+		return ErrFenced
+	}
+	if !m.permissions[commit.DocumentID][commit.ActorID].CanChangePermissions() {
+		return ErrPermissionDenied
+	}
+	delete(m.documents, commit.DocumentID)
+	delete(m.operations, commit.DocumentID)
+	delete(m.permissions, commit.DocumentID)
+	delete(m.requests, commit.DocumentID)
+	delete(m.snapshots, commit.DocumentID)
+	delete(m.authorities, commit.DocumentID)
+	delete(m.updatedAt, commit.DocumentID)
+	return nil
 }
 
 func (m *Memory) LoadDocument(ctx context.Context, id string) (DocumentState, error) {
@@ -215,6 +262,7 @@ func (m *Memory) CommitEdit(ctx context.Context, commit EditCommit) error {
 	}
 
 	m.documents[commit.Document.ID] = commit.Document
+	m.updatedAt[commit.Document.ID] = time.Now().UTC()
 	m.operations[commit.Document.ID] = append(m.operations[commit.Document.ID], commit.Operation)
 	if m.requests[commit.Document.ID] == nil {
 		m.requests[commit.Document.ID] = make(map[string]struct{})

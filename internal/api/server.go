@@ -16,6 +16,7 @@ import (
 	"github.com/jiawei-wang-dev/go-realtime-collab-editor/internal/protocol"
 	"github.com/jiawei-wang-dev/go-realtime-collab-editor/internal/room"
 	"github.com/jiawei-wang-dev/go-realtime-collab-editor/internal/storage"
+	websockettransport "github.com/jiawei-wang-dev/go-realtime-collab-editor/internal/websocket"
 )
 
 type Config struct {
@@ -39,6 +40,8 @@ type Config struct {
 	RefreshRateLimit      int
 	InternalRPCRateLimit  int
 	RateLimitWindow       time.Duration
+	BrowserCookieSecure   bool
+	BrowserRefreshTTL     time.Duration
 }
 
 type Server struct {
@@ -59,6 +62,9 @@ type Server struct {
 	refreshRateLimit      int
 	internalRPCRateLimit  int
 	rateLimitWindow       time.Duration
+	browserCookieSecure   bool
+	browserRefreshTTL     time.Duration
+	realtime              http.Handler
 }
 
 func NewServer() *Server {
@@ -86,10 +92,21 @@ func NewServerWithConfig(config Config) *Server {
 		rateLimiter:           config.RateLimiter, loginRateLimit: config.LoginRateLimit,
 		refreshRateLimit: config.RefreshRateLimit, internalRPCRateLimit: config.InternalRPCRateLimit,
 		rateLimitWindow: config.RateLimitWindow, allowedOrigins: make(map[string]struct{}, len(config.AllowedOrigins)),
+		browserCookieSecure: config.BrowserCookieSecure,
+		browserRefreshTTL:   config.BrowserRefreshTTL,
 	}
 	for _, origin := range config.AllowedOrigins {
 		server.allowedOrigins[origin] = struct{}{}
 	}
+	registry := (*authentication.ConnectionRegistry)(nil)
+	if config.AuthService != nil {
+		registry = config.AuthService.Registry()
+	}
+	server.realtime, _ = websockettransport.New(websockettransport.Config{
+		Manager: manager, Authenticator: config.Authenticator, ConnectionRegistry: registry,
+		AllowedOrigins: config.AllowedOrigins, OwnerResolver: config.OwnerResolver,
+		LocalNode: config.LocalNode, NodeDirectory: config.NodeDirectory,
+	})
 	server.handler = server.routes()
 	server.internal = server.internalRoutes()
 	return server
@@ -107,6 +124,9 @@ func withDefaults(config Config) Config {
 	}
 	if config.AuthenticationTimeout <= 0 {
 		config.AuthenticationTimeout = 5 * time.Second
+	}
+	if config.BrowserRefreshTTL <= 0 {
+		config.BrowserRefreshTTL = 7 * 24 * time.Hour
 	}
 	if config.LoginRateLimit <= 0 {
 		config.LoginRateLimit = 20
@@ -131,12 +151,131 @@ func (s *Server) routes() http.Handler {
 		mux.HandleFunc("POST /api/auth/refresh", s.refresh)
 		mux.HandleFunc("POST /api/auth/logout", s.logout)
 		mux.HandleFunc("GET /api/auth/me", s.me)
+		mux.HandleFunc("POST /api/browser/auth/login", s.browserLogin)
+		mux.HandleFunc("POST /api/browser/auth/refresh", s.browserRefresh)
+		mux.HandleFunc("POST /api/browser/auth/logout", s.browserLogout)
+	}
+	if s.realtime != nil {
+		mux.Handle("GET /api/realtime", s.realtime)
 	}
 	mux.HandleFunc("POST /api/documents", s.createDocument)
+	mux.HandleFunc("GET /api/documents", s.listDocuments)
 	mux.HandleFunc("GET /api/documents/{docID}", s.getDocument)
+	mux.HandleFunc("DELETE /api/documents/{docID}", s.deleteDocument)
+	mux.HandleFunc("GET /api/documents/{docID}/permissions", s.listPermissions)
 	mux.HandleFunc("GET /api/documents/{docID}/permissions/{userID}", s.getPermission)
 	mux.HandleFunc("PUT /api/documents/{docID}/permissions/{userID}", s.updatePermission)
+	if s.authService != nil {
+		mux.HandleFunc("GET /api/users/lookup", s.lookupUser)
+	}
 	return mux
+}
+
+func (s *Server) listDocuments(writer http.ResponseWriter, request *http.Request) {
+	principal, ok := s.authenticate(writer, request)
+	if !ok {
+		return
+	}
+	documents, err := s.store.ListDocuments(request.Context(), principal.UserID)
+	if err != nil {
+		writeError(writer, http.StatusInternalServerError, protocol.CodeInternalError, "could not list documents")
+		return
+	}
+	writeJSON(writer, http.StatusOK, struct {
+		Documents []storage.DocumentSummary `json:"documents"`
+	}{Documents: documents})
+}
+
+func (s *Server) listPermissions(writer http.ResponseWriter, request *http.Request) {
+	principal, ok := s.authenticate(writer, request)
+	if !ok {
+		return
+	}
+	docID := request.PathValue("docID")
+	actorRole, err := s.store.GetPermission(request.Context(), docID, principal.UserID)
+	if err != nil || !actorRole.CanChangePermissions() {
+		writeError(writer, http.StatusForbidden, protocol.CodePermissionDenied, "owner permission required")
+		return
+	}
+	permissions, err := s.store.GetPermissions(request.Context(), docID)
+	if err != nil {
+		writeRoomError(writer, err)
+		return
+	}
+	result := make([]permissionResponse, 0, len(permissions))
+	for userID, role := range permissions {
+		result = append(result, permissionResponse{DocID: docID, UserID: userID, Role: role})
+	}
+	writeJSON(writer, http.StatusOK, struct {
+		Permissions []permissionResponse `json:"permissions"`
+	}{Permissions: result})
+}
+
+func (s *Server) lookupUser(writer http.ResponseWriter, request *http.Request) {
+	if _, ok := s.authenticate(writer, request); !ok {
+		return
+	}
+	username := request.URL.Query().Get("username")
+	if username == "" {
+		writeError(writer, http.StatusBadRequest, protocol.CodeBadMessage, "username is required")
+		return
+	}
+	user, err := s.authService.LookupUser(request.Context(), username)
+	if err != nil {
+		writeError(writer, http.StatusNotFound, protocol.CodeBadMessage, "user not found")
+		return
+	}
+	writeJSON(writer, http.StatusOK, user)
+}
+
+func (s *Server) deleteDocument(writer http.ResponseWriter, request *http.Request) {
+	principal, ok := s.authenticate(writer, request)
+	if !ok {
+		return
+	}
+	docID := request.PathValue("docID")
+	if s.ownerResolver != nil {
+		owner, err := s.ownerResolver.EnsureOwner(request.Context(), docID)
+		if err != nil {
+			writeError(writer, http.StatusServiceUnavailable, protocol.CodeServiceUnavailable, "document owner is unavailable")
+			return
+		}
+		if !s.isLocalOwner(owner) {
+			if s.forwarder == nil {
+				writeError(writer, http.StatusServiceUnavailable, protocol.CodeServiceUnavailable, "document owner is unavailable")
+				return
+			}
+			if err := s.forwarder.ForwardDeleteDocument(request.Context(), owner, request.Header.Get("Authorization"), docID); err != nil {
+				s.writeForwardError(writer, err)
+				return
+			}
+			writer.WriteHeader(http.StatusNoContent)
+			return
+		}
+	}
+	if err := s.deleteLocalDocument(request.Context(), principal.UserID, docID); err != nil {
+		writeRoomError(writer, err)
+		return
+	}
+	writer.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Server) deleteLocalDocument(ctx context.Context, actorID, docID string) error {
+	targetRoom, err := s.manager.Room(docID)
+	if err != nil {
+		return err
+	}
+	if _, err := targetRoom.PermissionContext(ctx, actorID, actorID); err != nil {
+		return err
+	}
+	authority, err := s.store.GetWriteAuthority(ctx, docID)
+	if err != nil {
+		return err
+	}
+	if err := s.manager.StopRoom(ctx, docID); err != nil {
+		return &room.CodedError{Code: protocol.CodeServiceUnavailable, Message: "document is busy"}
+	}
+	return s.store.DeleteDocument(ctx, storage.DeleteDocumentCommit{Authority: authority, DocumentID: docID, ActorID: actorID})
 }
 
 func (s *Server) ServeHTTP(writer http.ResponseWriter, request *http.Request) {

@@ -36,7 +36,7 @@ func TestSnapshotPrunesHistoryAndResumeChoosesSyncOrResync(t *testing.T) {
 		t.Fatal(err)
 	}
 	message := <-current.Send
-	if message.Type != protocol.TypeSync || message.FromVersion != 2 || message.ToVersion != 2 || len(message.Operations) != 0 {
+	if message.Type != protocol.TypeSync || message.FromVersion != 2 || message.ToVersion != 2 || len(message.Operations) != 0 || message.Role != permission.RoleOwner {
 		t.Fatalf("current resume = %#v", message)
 	}
 	target.Leave(current)
@@ -46,7 +46,7 @@ func TestSnapshotPrunesHistoryAndResumeChoosesSyncOrResync(t *testing.T) {
 		t.Fatal(err)
 	}
 	message = <-old.Send
-	if message.Type != protocol.TypeResyncRequired || message.Snapshot == nil || message.Snapshot.Version != 2 || message.Snapshot.Content != "aXY" || message.CurrentVersion != 2 {
+	if message.Type != protocol.TypeResyncRequired || message.Snapshot == nil || message.Snapshot.Version != 2 || message.Snapshot.Content != "aXY" || message.CurrentVersion != 2 || message.Role != permission.RoleOwner {
 		t.Fatalf("old resume = %#v", message)
 	}
 	target.Leave(old)

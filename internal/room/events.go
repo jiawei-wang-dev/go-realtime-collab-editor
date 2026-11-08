@@ -5,6 +5,7 @@ import (
 
 	"github.com/jiawei-wang-dev/go-realtime-collab-editor/internal/collab"
 	"github.com/jiawei-wang-dev/go-realtime-collab-editor/internal/permission"
+	"github.com/jiawei-wang-dev/go-realtime-collab-editor/internal/protocol"
 	"github.com/jiawei-wang-dev/go-realtime-collab-editor/internal/storage"
 	"github.com/jiawei-wang-dev/go-realtime-collab-editor/internal/transport"
 )
@@ -42,6 +43,14 @@ type editEvent struct {
 }
 
 func (editEvent) isRoomEvent() {}
+
+type cursorEvent struct {
+	client transport.Client
+	cursor protocol.CursorState
+	reply  chan error
+}
+
+func (cursorEvent) isRoomEvent() {}
 
 type permissionChangedEvent struct {
 	ctx     context.Context

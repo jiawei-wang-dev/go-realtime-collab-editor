@@ -138,6 +138,37 @@ func (client *Client) ForwardGetPermission(ctx context.Context, owner cluster.Ow
 	return result.Role, nil
 }
 
+func (client *Client) ForwardDeleteDocument(ctx context.Context, owner cluster.Owner, authorization, documentID string) error {
+	if authorization == "" {
+		return errors.New("forwarded authorization is required")
+	}
+	node, exists := client.directory.Lookup(owner.NodeID, owner.Incarnation)
+	if !exists || !node.IsReady() {
+		return errors.New("owner node is not present in trusted membership")
+	}
+	endpoint, serverName, err := trustedEndpoint(node.HTTPEndpoint)
+	if err != nil {
+		return err
+	}
+	requestCtx, cancel := context.WithTimeout(ctx, client.timeout)
+	defer cancel()
+	request, err := http.NewRequestWithContext(requestCtx, http.MethodDelete, endpoint+documentRPCPath+url.PathEscape(documentID), nil)
+	if err != nil {
+		return fmt.Errorf("build internal delete request: %w", err)
+	}
+	request.Header.Set("Authorization", authorization)
+	otel.GetTextMapPropagator().Inject(request.Context(), propagation.HeaderCarrier(request.Header))
+	response, err := client.do(request, serverName)
+	if err != nil {
+		return fmt.Errorf("call owner delete endpoint: %w", err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode >= 200 && response.StatusCode < 300 {
+		return nil
+	}
+	return decodeRemoteError(response, "owner node rejected the document delete request")
+}
+
 func (client *Client) get(ctx context.Context, owner cluster.Owner, authorization, path string) (*http.Response, error) {
 	if authorization == "" {
 		return nil, errors.New("forwarded authorization is required")

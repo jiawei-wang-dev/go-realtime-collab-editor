@@ -11,7 +11,10 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
+	"github.com/coder/websocket"
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/propagation"
 	"go.opentelemetry.io/otel/trace"
@@ -67,6 +70,31 @@ func TestMetricsUseOnlyBoundedLabelsAndInstrumentHTTP(t *testing.T) {
 			}
 		}
 	}
+}
+
+func TestHTTPInstrumentationPreservesWebSocketUpgrade(t *testing.T) {
+	metrics := NewMetrics()
+	handler := otelhttp.NewHandler(metrics.InstrumentHTTP("public", http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		connection, err := websocket.Accept(writer, request, nil)
+		if err != nil {
+			t.Errorf("accept websocket: %v", err)
+			return
+		}
+		_ = connection.Close(websocket.StatusNormalClosure, "test complete")
+	})), "test.http")
+	server := httptest.NewServer(handler)
+	t.Cleanup(server.Close)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	connection, response, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(server.URL, "http"), nil)
+	if err != nil {
+		if response != nil {
+			t.Fatalf("dial websocket: %v (status %d)", err, response.StatusCode)
+		}
+		t.Fatalf("dial websocket: %v", err)
+	}
+	_ = connection.CloseNow()
 }
 
 func TestHealthReadinessAndConcurrentAccess(t *testing.T) {

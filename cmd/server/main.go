@@ -309,6 +309,8 @@ func newApplication(runtimeConfig config.Config, store storage.Store, authentica
 		RefreshRateLimit:     runtimeConfig.Security.RefreshRateLimit,
 		InternalRPCRateLimit: runtimeConfig.Security.InternalRPCRateLimit,
 		RateLimitWindow:      runtimeConfig.Security.RateLimitWindow,
+		BrowserCookieSecure:  runtimeConfig.Environment == "production",
+		BrowserRefreshTTL:    runtimeConfig.RefreshTTL,
 	})
 }
 

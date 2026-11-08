@@ -20,6 +20,10 @@ const (
 	TypeResyncRequired    = "resync_required"
 	TypeError             = "error"
 	TypeOwnerRedirect     = "owner_redirect"
+	TypePresenceChanged   = "presence_changed"
+	TypeCursorUpdate      = "cursor_update"
+	TypeCursorChanged     = "cursor_changed"
+	TypeCursorRemoved     = "cursor_removed"
 )
 
 const (
@@ -41,7 +45,19 @@ type Snapshot struct {
 
 type VersionedOperation struct {
 	Version   uint64           `json:"version"`
+	RequestID string           `json:"request_id,omitempty"`
 	Operation collab.Operation `json:"operation"`
+}
+
+// CursorState uses Unicode code-point offsets, matching collab.Operation.
+// User identity fields are populated by the server and ignored on input.
+type CursorState struct {
+	UserID   string `json:"user_id,omitempty"`
+	Username string `json:"username,omitempty"`
+	Anchor   int    `json:"anchor"`
+	Head     int    `json:"head"`
+	Version  uint64 `json:"version"`
+	Sequence uint64 `json:"sequence"`
 }
 
 type Message struct {
@@ -63,6 +79,8 @@ type Message struct {
 	Message        string               `json:"message,omitempty"`
 	Token          string               `json:"token,omitempty"`
 	Endpoint       string               `json:"endpoint,omitempty"`
+	UserIDs        []string             `json:"user_ids,omitempty"`
+	Cursor         *CursorState         `json:"cursor,omitempty"`
 }
 
 // MarshalJSON preserves zero versions and empty content in the initial joined
@@ -90,7 +108,8 @@ func (m Message) MarshalJSON() ([]byte, error) {
 			FromVersion uint64               `json:"from_version"`
 			ToVersion   uint64               `json:"to_version"`
 			Operations  []VersionedOperation `json:"operations"`
-		}{m.Type, m.DocID, m.FromVersion, m.ToVersion, nonNilOperations(m.Operations)})
+			Role        permission.Role      `json:"role"`
+		}{m.Type, m.DocID, m.FromVersion, m.ToVersion, nonNilOperations(m.Operations), m.Role})
 	}
 	if m.Type == TypeResyncRequired {
 		return json.Marshal(struct {
@@ -99,7 +118,8 @@ func (m Message) MarshalJSON() ([]byte, error) {
 			Snapshot       *Snapshot            `json:"snapshot"`
 			Operations     []VersionedOperation `json:"operations"`
 			CurrentVersion uint64               `json:"current_version"`
-		}{m.Type, m.DocID, m.Snapshot, nonNilOperations(m.Operations), m.CurrentVersion})
+			Role           permission.Role      `json:"role"`
+		}{m.Type, m.DocID, m.Snapshot, nonNilOperations(m.Operations), m.CurrentVersion, m.Role})
 	}
 
 	type messageAlias Message

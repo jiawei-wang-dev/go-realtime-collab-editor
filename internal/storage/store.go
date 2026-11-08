@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/jiawei-wang-dev/go-realtime-collab-editor/internal/collab"
 	"github.com/jiawei-wang-dev/go-realtime-collab-editor/internal/permission"
@@ -83,11 +84,26 @@ type Snapshot struct {
 	Content    string
 }
 
+type DocumentSummary struct {
+	ID        string          `json:"id"`
+	Version   uint64          `json:"version"`
+	Role      permission.Role `json:"role"`
+	UpdatedAt time.Time       `json:"updated_at"`
+}
+
+type DeleteDocumentCommit struct {
+	Authority  WriteAuthority
+	DocumentID string
+	ActorID    string
+}
+
 // Store is the persistence boundary shared by the API and collaboration Rooms.
 // Implementations must make CreateDocument, CommitEdit, and SetPermission
 // atomic. A successful return means the change is durable in that Store.
 type Store interface {
 	CreateDocument(ctx context.Context, id, content, ownerID string) (collab.Document, error)
+	ListDocuments(ctx context.Context, userID string) ([]DocumentSummary, error)
+	DeleteDocument(ctx context.Context, commit DeleteDocumentCommit) error
 	GetWriteAuthority(ctx context.Context, docID string) (WriteAuthority, error)
 	ActivateOwnership(ctx context.Context, docID string, authority WriteAuthority) error
 	LoadDocument(ctx context.Context, id string) (DocumentState, error)

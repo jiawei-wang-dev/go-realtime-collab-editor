@@ -55,9 +55,10 @@ func (s *Server) allowOrigin(writer http.ResponseWriter, request *http.Request) 
 		return false
 	}
 	writer.Header().Set("Access-Control-Allow-Origin", origin)
+	writer.Header().Set("Access-Control-Allow-Credentials", "true")
 	writer.Header().Set("Vary", "Origin")
 	if request.Method == http.MethodOptions {
-		writer.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, OPTIONS")
+		writer.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
 		writer.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type")
 		writer.Header().Set("Access-Control-Max-Age", "600")
 		writer.WriteHeader(http.StatusNoContent)

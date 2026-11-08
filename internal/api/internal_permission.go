@@ -15,8 +15,26 @@ func (s *Server) internalRoutes() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("PUT /internal/v1/permissions", s.internalUpdatePermission)
 	mux.HandleFunc("GET /internal/v1/documents/{docID}", s.internalGetDocument)
+	mux.HandleFunc("DELETE /internal/v1/documents/{docID}", s.internalDeleteDocument)
 	mux.HandleFunc("GET /internal/v1/documents/{docID}/permissions/{userID}", s.internalGetPermission)
 	return mux
+}
+
+func (s *Server) internalDeleteDocument(writer http.ResponseWriter, request *http.Request) {
+	principal, release, ok := s.authenticateInternalRequest(writer, request)
+	if !ok {
+		return
+	}
+	defer release()
+	documentID := request.PathValue("docID")
+	if !s.requireLocalRoute(writer, request, documentID) {
+		return
+	}
+	if err := s.deleteLocalDocument(request.Context(), principal.UserID, documentID); err != nil {
+		writeRoomError(writer, err)
+		return
+	}
+	writer.WriteHeader(http.StatusNoContent)
 }
 
 func (s *Server) internalUpdatePermission(writer http.ResponseWriter, request *http.Request) {

@@ -136,6 +136,49 @@ func TestProtectedDocumentAndPermissionREST(t *testing.T) {
 	getPermissionStatus(t, server.URL, "doc", "owner", "writer", http.StatusOK)
 	getPermissionStatus(t, server.URL, "doc", "writer", "writer", http.StatusForbidden)
 	setPermission(t, server.URL, "doc", "writer", "reader", permission.RoleRead, http.StatusForbidden)
+
+	listRequest, _ := http.NewRequest(http.MethodGet, server.URL+"/api/documents", nil)
+	listRequest.Header.Set("X-User-ID", "writer")
+	listResponse, err := http.DefaultClient.Do(listRequest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listResponse.Body.Close()
+	var listed struct {
+		Documents []struct {
+			ID   string          `json:"id"`
+			Role permission.Role `json:"role"`
+		} `json:"documents"`
+	}
+	if err := json.NewDecoder(listResponse.Body).Decode(&listed); err != nil {
+		t.Fatal(err)
+	}
+	if listResponse.StatusCode != http.StatusOK || len(listed.Documents) != 1 || listed.Documents[0].ID != "doc" || listed.Documents[0].Role != permission.RoleWrite {
+		t.Fatalf("document list = %#v status=%d", listed, listResponse.StatusCode)
+	}
+
+	permissionsRequest, _ := http.NewRequest(http.MethodGet, server.URL+"/api/documents/doc/permissions", nil)
+	permissionsRequest.Header.Set("X-User-ID", "owner")
+	permissionsResponse, err := http.DefaultClient.Do(permissionsRequest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	permissionsResponse.Body.Close()
+	if permissionsResponse.StatusCode != http.StatusOK {
+		t.Fatalf("permissions status = %d", permissionsResponse.StatusCode)
+	}
+
+	deleteRequest, _ := http.NewRequest(http.MethodDelete, server.URL+"/api/documents/doc", nil)
+	deleteRequest.Header.Set("X-User-ID", "owner")
+	deleteResponse, err := http.DefaultClient.Do(deleteRequest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	deleteResponse.Body.Close()
+	if deleteResponse.StatusCode != http.StatusNoContent {
+		t.Fatalf("delete status = %d", deleteResponse.StatusCode)
+	}
+	getDocumentStatus(t, server.URL, "doc", "owner", http.StatusNotFound)
 }
 
 func TestRESTRejectsMalformedJSONAndDuplicateDocument(t *testing.T) {
@@ -259,6 +302,10 @@ func (forwarder *recordingForwarder) ForwardDocument(context.Context, cluster.Ow
 func (forwarder *recordingForwarder) ForwardGetPermission(context.Context, cluster.Owner, string, string, string) (permission.Role, error) {
 	forwarder.permissionReadCalls++
 	return forwarder.role, forwarder.err
+}
+
+func (forwarder *recordingForwarder) ForwardDeleteDocument(context.Context, cluster.Owner, string, string) error {
+	return forwarder.err
 }
 
 var _ cluster.PermissionForwarder = (*recordingForwarder)(nil)

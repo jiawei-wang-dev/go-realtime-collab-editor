@@ -12,6 +12,11 @@ __MACOSX/
 # Go build and test artifacts
 /bin/
 /dist/
+frontend/dist/
+frontend/node_modules/
+frontend/coverage/
+frontend/playwright-report/
+frontend/test-results/
 *.test
 coverage.out
 *.prof

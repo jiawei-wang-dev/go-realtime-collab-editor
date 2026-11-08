@@ -23,12 +23,13 @@ var identityPattern = regexp.MustCompile(`^[A-Za-z0-9._-]{1,128}$`)
 // Node identifies one service process. Incarnation distinguishes successive
 // processes that reuse the same NodeID.
 type Node struct {
-	NodeID       string     `json:"node_id"`
-	Incarnation  string     `json:"incarnation"`
-	QUICEndpoint string     `json:"quic_endpoint"`
-	HTTPEndpoint string     `json:"http_endpoint"`
-	Status       NodeStatus `json:"status"`
-	StartedAt    time.Time  `json:"started_at"`
+	NodeID          string     `json:"node_id"`
+	Incarnation     string     `json:"incarnation"`
+	QUICEndpoint    string     `json:"quic_endpoint"`
+	HTTPEndpoint    string     `json:"http_endpoint"`
+	BrowserEndpoint string     `json:"browser_endpoint,omitempty"`
+	Status          NodeStatus `json:"status"`
+	StartedAt       time.Time  `json:"started_at"`
 }
 
 func NewIncarnation() (string, error) {

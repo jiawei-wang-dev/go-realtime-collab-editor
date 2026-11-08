@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"net/http/cookiejar"
 	"net/http/httptest"
 	"strings"
 	"testing"
@@ -149,6 +150,42 @@ func TestRefreshAndLogoutEndpoints(t *testing.T) {
 	response.Body.Close()
 	if response.StatusCode != http.StatusUnauthorized {
 		t.Fatalf("logged-out token status = %d", response.StatusCode)
+	}
+}
+
+func TestBrowserAuthenticationKeepsRefreshTokenInHTTPOnlyCookie(t *testing.T) {
+	fixture := newAuthFixture(t)
+	body := `{"username":"browser-user","password":"password1"}`
+	response, err := http.Post(fixture.server.URL+"/api/auth/register", "application/json", strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	response.Body.Close()
+	jar, _ := cookiejar.New(nil)
+	client := &http.Client{Jar: jar}
+	response, err = client.Post(fixture.server.URL+"/api/browser/auth/login", "application/json", strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var loginBody map[string]any
+	if err := json.NewDecoder(response.Body).Decode(&loginBody); err != nil {
+		t.Fatal(err)
+	}
+	response.Body.Close()
+	if response.StatusCode != http.StatusOK || loginBody["access_token"] == "" || loginBody["refresh_token"] != nil {
+		t.Fatalf("browser login = %#v status=%d", loginBody, response.StatusCode)
+	}
+	cookies := response.Cookies()
+	if len(cookies) != 1 || !cookies[0].HttpOnly || cookies[0].Name != browserRefreshCookie {
+		t.Fatalf("refresh cookie = %#v", cookies)
+	}
+	response, err = client.Post(fixture.server.URL+"/api/browser/auth/refresh", "application/json", strings.NewReader(`{"request_id":"browser-refresh"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("browser refresh status = %d", response.StatusCode)
 	}
 }
 

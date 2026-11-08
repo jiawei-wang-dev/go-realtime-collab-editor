@@ -164,6 +164,7 @@ func TestLoadClusterConfiguration(t *testing.T) {
 	t.Setenv("NODE_ID", "node-a")
 	t.Setenv("NODE_QUIC_ENDPOINT", "node-a:8443")
 	t.Setenv("NODE_HTTP_ENDPOINT", "https://node-a:9443")
+	t.Setenv("NODE_BROWSER_ENDPOINT", "https://node-a.example:8080")
 	t.Setenv("ETCD_ENDPOINTS", "https://etcd-a:2379, https://etcd-b:2379")
 	t.Setenv("ETCD_CA_FILE", "ca.crt")
 	t.Setenv("ETCD_CERT_FILE", "client.crt")
@@ -180,6 +181,9 @@ func TestLoadClusterConfiguration(t *testing.T) {
 	}
 	if loaded.Cluster.Node.Incarnation == "" || loaded.Cluster.Node.StartedAt.IsZero() {
 		t.Fatal("process identity was not generated")
+	}
+	if loaded.Cluster.Node.BrowserEndpoint != "https://node-a.example:8080" {
+		t.Fatalf("browser endpoint = %q", loaded.Cluster.Node.BrowserEndpoint)
 	}
 }
 

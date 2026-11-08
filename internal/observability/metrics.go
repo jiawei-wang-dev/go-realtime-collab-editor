@@ -1,8 +1,10 @@
 package observability
 
 import (
+	"bufio"
 	"database/sql"
 	"errors"
+	"net"
 	"net/http"
 	"strconv"
 	"time"
@@ -153,6 +155,18 @@ func (metrics *Metrics) InstrumentHTTP(scope string, next http.Handler) http.Han
 type statusRecorder struct {
 	http.ResponseWriter
 	status int
+}
+
+func (writer *statusRecorder) Unwrap() http.ResponseWriter {
+	return writer.ResponseWriter
+}
+
+func (writer *statusRecorder) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	connection, buffered, err := http.NewResponseController(writer.ResponseWriter).Hijack()
+	if err == nil {
+		writer.status = http.StatusSwitchingProtocols
+	}
+	return connection, buffered, err
 }
 
 func (writer *statusRecorder) WriteHeader(status int) {

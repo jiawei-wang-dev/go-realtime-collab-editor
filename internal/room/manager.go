@@ -438,6 +438,27 @@ func (manager *Manager) Shutdown(ctx context.Context) error {
 	return nil
 }
 
+// StopRoom is a synchronization barrier used before destructive document
+// operations. It prevents the current authoritative goroutine from accepting
+// more edits and waits until all clients have been detached.
+func (manager *Manager) StopRoom(ctx context.Context, documentID string) error {
+	manager.mu.Lock()
+	entry := manager.rooms[documentID]
+	if entry != nil && entry.room != nil {
+		entry.room.cancel()
+	}
+	manager.mu.Unlock()
+	if entry == nil {
+		return nil
+	}
+	select {
+	case <-entry.stopped:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
 func (manager *Manager) roomCount() int {
 	manager.mu.Lock()
 	defer manager.mu.Unlock()

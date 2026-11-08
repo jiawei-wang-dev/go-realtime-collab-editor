@@ -252,12 +252,13 @@ func loadClusterConfig(config *Config) error {
 		}
 	}
 	config.Cluster.Node = cluster.Node{
-		NodeID:       os.Getenv("NODE_ID"),
-		Incarnation:  incarnation,
-		QUICEndpoint: os.Getenv("NODE_QUIC_ENDPOINT"),
-		HTTPEndpoint: os.Getenv("NODE_HTTP_ENDPOINT"),
-		Status:       cluster.NodeStarting,
-		StartedAt:    time.Now().UTC(),
+		NodeID:          os.Getenv("NODE_ID"),
+		Incarnation:     incarnation,
+		QUICEndpoint:    os.Getenv("NODE_QUIC_ENDPOINT"),
+		HTTPEndpoint:    os.Getenv("NODE_HTTP_ENDPOINT"),
+		BrowserEndpoint: os.Getenv("NODE_BROWSER_ENDPOINT"),
+		Status:          cluster.NodeStarting,
+		StartedAt:       time.Now().UTC(),
 	}
 	if err := config.Cluster.Node.Validate(); err != nil {
 		return fmt.Errorf("invalid cluster node configuration: %w", err)
@@ -265,6 +266,12 @@ func loadClusterConfig(config *Config) error {
 	internalEndpoint, err := url.Parse(config.Cluster.Node.HTTPEndpoint)
 	if err != nil || internalEndpoint.Scheme != "https" || internalEndpoint.Host == "" {
 		return fmt.Errorf("NODE_HTTP_ENDPOINT must be an absolute HTTPS URL in cluster mode")
+	}
+	if config.Cluster.Node.BrowserEndpoint != "" {
+		browserEndpoint, parseErr := url.Parse(config.Cluster.Node.BrowserEndpoint)
+		if parseErr != nil || browserEndpoint.Scheme != "https" || browserEndpoint.Host == "" {
+			return fmt.Errorf("NODE_BROWSER_ENDPOINT must be an absolute HTTPS URL in cluster mode")
+		}
 	}
 	for _, endpoint := range strings.Split(os.Getenv("ETCD_ENDPOINTS"), ",") {
 		if endpoint = strings.TrimSpace(endpoint); endpoint != "" {

@@ -16,6 +16,7 @@ type PermissionForwarder interface {
 	ForwardPermission(ctx context.Context, owner Owner, authorization, documentID, userID string, role permission.Role) error
 	ForwardDocument(ctx context.Context, owner Owner, authorization, documentID string) (collab.Document, error)
 	ForwardGetPermission(ctx context.Context, owner Owner, authorization, documentID, userID string) (permission.Role, error)
+	ForwardDeleteDocument(ctx context.Context, owner Owner, authorization, documentID string) error
 }
 
 type RemoteError struct {

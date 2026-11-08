@@ -113,6 +113,19 @@ func (s *Service) Register(ctx context.Context, username, password string) (User
 	user.PasswordHash = ""
 	return user, nil
 }
+
+// LookupUser exposes only the public user record needed by owner-managed
+// sharing. Authorization is enforced by the API before this method is called.
+func (s *Service) LookupUser(ctx context.Context, username string) (User, error) {
+	user, err := s.users.GetUserByUsername(ctx, username)
+	if err != nil {
+		return User{}, err
+	}
+	if user.Status != UserActive {
+		return User{}, ErrUserDisabled
+	}
+	return user, nil
+}
 func (s *Service) Login(ctx context.Context, username, password string) (TokenPair, error) {
 	user, err := s.users.GetUserByUsername(ctx, username)
 	if err != nil {
@@ -279,6 +292,11 @@ func (s *Service) AuthenticateToken(ctx context.Context, token string) (Principa
 	if err := s.ValidatePrincipal(ctx, principal); err != nil {
 		return Principal{}, err
 	}
+	user, err := s.users.GetUserByID(ctx, principal.UserID)
+	if err != nil {
+		return Principal{}, ErrUserDisabled
+	}
+	principal.Username = user.Username
 	return principal, nil
 }
 func (s *Service) AuthenticateHTTP(request *http.Request) (Principal, error) {

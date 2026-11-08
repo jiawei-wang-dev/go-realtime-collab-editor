@@ -24,6 +24,83 @@ type refreshRequest struct {
 	RequestID    string `json:"request_id,omitempty"`
 }
 
+const browserRefreshCookie = "collab_refresh"
+
+type accessTokenResponse struct {
+	AccessToken string `json:"access_token"`
+	TokenType   string `json:"token_type"`
+	ExpiresIn   int64  `json:"expires_in"`
+}
+
+func accessOnly(pair authentication.TokenPair) accessTokenResponse {
+	return accessTokenResponse{AccessToken: pair.AccessToken, TokenType: pair.TokenType, ExpiresIn: pair.ExpiresIn}
+}
+
+func (s *Server) setBrowserRefreshCookie(writer http.ResponseWriter, token string, maxAge int) {
+	http.SetCookie(writer, &http.Cookie{Name: browserRefreshCookie, Value: token, Path: "/api/browser/auth", HttpOnly: true, Secure: s.browserCookieSecure, SameSite: http.SameSiteStrictMode, MaxAge: maxAge})
+}
+
+func (s *Server) browserLogin(writer http.ResponseWriter, request *http.Request) {
+	if !s.allowRequest(writer, request, "browser-login", s.loginRateLimit) {
+		return
+	}
+	var body credentialsRequest
+	if err := decodeJSON(request, &body); err != nil {
+		writeError(writer, http.StatusBadRequest, protocol.CodeBadMessage, err.Error())
+		return
+	}
+	pair, err := s.authService.Login(request.Context(), body.Username, body.Password)
+	if err != nil {
+		if errors.Is(err, authentication.ErrInvalidCredentials) {
+			writeError(writer, http.StatusUnauthorized, codeInvalidCredentials, "invalid username or password")
+			return
+		}
+		writeError(writer, http.StatusServiceUnavailable, protocol.CodeInternalError, "authentication service unavailable")
+		return
+	}
+	s.setBrowserRefreshCookie(writer, pair.RefreshToken, int(s.browserRefreshTTL.Seconds()))
+	writeJSON(writer, http.StatusOK, accessOnly(pair))
+}
+
+func (s *Server) browserRefresh(writer http.ResponseWriter, request *http.Request) {
+	if !s.allowRequest(writer, request, "browser-refresh", s.refreshRateLimit) {
+		return
+	}
+	cookie, err := request.Cookie(browserRefreshCookie)
+	if err != nil || cookie.Value == "" {
+		writeError(writer, http.StatusUnauthorized, codeAuthenticationRequired, "valid refresh cookie is required")
+		return
+	}
+	var body struct {
+		RequestID string `json:"request_id"`
+	}
+	if err := decodeJSON(request, &body); err != nil {
+		writeError(writer, http.StatusBadRequest, protocol.CodeBadMessage, err.Error())
+		return
+	}
+	pair, err := s.authService.RefreshWithRequestID(request.Context(), cookie.Value, body.RequestID)
+	if err != nil {
+		s.setBrowserRefreshCookie(writer, "", -1)
+		writeError(writer, http.StatusUnauthorized, codeAuthenticationRequired, "invalid refresh token")
+		return
+	}
+	s.setBrowserRefreshCookie(writer, pair.RefreshToken, int(s.browserRefreshTTL.Seconds()))
+	writeJSON(writer, http.StatusOK, accessOnly(pair))
+}
+
+func (s *Server) browserLogout(writer http.ResponseWriter, request *http.Request) {
+	principal, ok := s.authenticate(writer, request)
+	if !ok {
+		return
+	}
+	if err := s.authService.Logout(request.Context(), principal); err != nil {
+		writeError(writer, http.StatusUnauthorized, codeAuthenticationRequired, "session is not active")
+		return
+	}
+	s.setBrowserRefreshCookie(writer, "", -1)
+	writer.WriteHeader(http.StatusNoContent)
+}
+
 func (s *Server) authenticate(writer http.ResponseWriter, request *http.Request) (authentication.Principal, bool) {
 	authContext, cancel := context.WithTimeout(request.Context(), s.authenticationTimeout)
 	defer cancel()

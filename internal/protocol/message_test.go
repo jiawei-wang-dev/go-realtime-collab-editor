@@ -30,7 +30,7 @@ func TestJoinedMessageIncludesZeroVersionAndEmptyContent(t *testing.T) {
 }
 
 func TestSyncMessageIncludesZeroVersionsAndEmptyOperations(t *testing.T) {
-	payload, err := json.Marshal(Message{Type: TypeSync, DocID: "doc"})
+	payload, err := json.Marshal(Message{Type: TypeSync, DocID: "doc", Role: permission.RoleWrite})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -38,7 +38,7 @@ func TestSyncMessageIncludesZeroVersionsAndEmptyOperations(t *testing.T) {
 	if err := json.Unmarshal(payload, &decoded); err != nil {
 		t.Fatal(err)
 	}
-	for _, field := range []string{"from_version", "to_version", "operations"} {
+	for _, field := range []string{"from_version", "to_version", "operations", "role"} {
 		if _, ok := decoded[field]; !ok {
 			t.Fatalf("sync payload omits %s: %s", field, payload)
 		}
@@ -50,6 +50,7 @@ func TestResyncMessageIncludesSnapshotAndCurrentVersion(t *testing.T) {
 		Type:     TypeResyncRequired,
 		DocID:    "doc",
 		Snapshot: &Snapshot{Version: 0, Content: ""},
+		Role:     permission.RoleRead,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -58,7 +59,7 @@ func TestResyncMessageIncludesSnapshotAndCurrentVersion(t *testing.T) {
 	if err := json.Unmarshal(payload, &decoded); err != nil {
 		t.Fatal(err)
 	}
-	for _, field := range []string{"snapshot", "operations", "current_version"} {
+	for _, field := range []string{"snapshot", "operations", "current_version", "role"} {
 		if _, ok := decoded[field]; !ok {
 			t.Fatalf("resync payload omits %s: %s", field, payload)
 		}

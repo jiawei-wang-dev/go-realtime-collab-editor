@@ -112,6 +112,74 @@ func (s *Store) CreateDocument(ctx context.Context, id, content, ownerID string)
 	return collab.Document{ID: id, Content: content}, nil
 }
 
+func (s *Store) ListDocuments(ctx context.Context, userID string) ([]storage.DocumentSummary, error) {
+	ctx, cancel := s.withTimeout(ctx)
+	defer cancel()
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT d.id, d.version, p.role, d.updated_at
+		FROM documents d
+		JOIN document_permissions p ON p.document_id = d.id
+		WHERE p.user_id = ?
+		ORDER BY d.updated_at DESC, d.id ASC`, userID)
+	if err != nil {
+		return nil, fmt.Errorf("list documents: %w", err)
+	}
+	defer rows.Close()
+	result := make([]storage.DocumentSummary, 0)
+	for rows.Next() {
+		var summary storage.DocumentSummary
+		if err := rows.Scan(&summary.ID, &summary.Version, &summary.Role, &summary.UpdatedAt); err != nil {
+			return nil, fmt.Errorf("scan document summary: %w", err)
+		}
+		result = append(result, summary)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate documents: %w", err)
+	}
+	return result, nil
+}
+
+func (s *Store) DeleteDocument(ctx context.Context, commit storage.DeleteDocumentCommit) error {
+	if err := storage.ValidateWriteAuthority(commit.Authority); err != nil {
+		return err
+	}
+	ctx, cancel := s.withTimeout(ctx)
+	defer cancel()
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin delete document: %w", err)
+	}
+	defer tx.Rollback()
+	current, err := getWriteAuthorityForUpdate(ctx, tx, commit.DocumentID)
+	if err != nil {
+		return err
+	}
+	if current != commit.Authority {
+		return storage.ErrFenced
+	}
+	var actorRole permission.Role
+	if err := tx.QueryRowContext(ctx, `SELECT role FROM document_permissions WHERE document_id = ? AND user_id = ? FOR UPDATE`, commit.DocumentID, commit.ActorID).Scan(&actorRole); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return storage.ErrPermissionDenied
+		}
+		return fmt.Errorf("load delete permission: %w", err)
+	}
+	if !actorRole.CanChangePermissions() {
+		return storage.ErrPermissionDenied
+	}
+	result, err := tx.ExecContext(ctx, `DELETE FROM documents WHERE id = ? AND owner_node_id = ? AND fencing_token = ?`, commit.DocumentID, commit.Authority.NodeID, commit.Authority.FencingToken)
+	if err != nil {
+		return fmt.Errorf("delete document: %w", err)
+	}
+	if rows, err := result.RowsAffected(); err != nil || rows != 1 {
+		return storage.ErrFenced
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit delete document: %w", err)
+	}
+	return nil
+}
+
 func (s *Store) GetWriteAuthority(ctx context.Context, docID string) (storage.WriteAuthority, error) {
 	ctx, cancel := s.withTimeout(ctx)
 	defer cancel()

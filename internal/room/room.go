@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -21,6 +22,7 @@ type Room struct {
 	docID          string
 	events         chan event
 	clients        map[transport.Client]struct{}
+	cursors        map[transport.Client]protocol.CursorState
 	clientCount    atomic.Int64
 	document       collab.Document
 	history        []collab.AppliedOperation
@@ -63,6 +65,7 @@ func newRoom(
 		docID:            document.ID,
 		events:           make(chan event),
 		clients:          make(map[transport.Client]struct{}),
+		cursors:          make(map[transport.Client]protocol.CursorState),
 		document:         document,
 		history:          history,
 		historyFloor:     latestSnapshot.Version,
@@ -126,6 +129,8 @@ func (r *Room) handle(roomEvent event) {
 		r.handleLeave(current)
 	case editEvent:
 		r.handleEdit(current)
+	case cursorEvent:
+		r.handleCursor(current)
 	case permissionChangedEvent:
 		r.handlePermissionChanged(current)
 	case snapshotEvent:
@@ -185,6 +190,14 @@ func (r *Room) SubmitEdit(client transport.Client, requestID string, operation c
 func (r *Room) SubmitEditContext(ctx context.Context, client transport.Client, requestID string, operation collab.Operation) error {
 	reply := make(chan error, 1)
 	if err := r.dispatch(ctx, editEvent{ctx: ctx, client: client, requestID: requestID, operation: operation, reply: reply}); err != nil {
+		return err
+	}
+	return waitError(ctx, r.ctx, reply)
+}
+
+func (r *Room) SubmitCursorContext(ctx context.Context, client transport.Client, cursor protocol.CursorState) error {
+	reply := make(chan error, 1)
+	if err := r.dispatch(ctx, cursorEvent{client: client, cursor: cursor, reply: reply}); err != nil {
 		return err
 	}
 	return waitError(ctx, r.ctx, reply)
@@ -314,6 +327,8 @@ func (r *Room) handleJoin(event joinEvent) {
 		event.reply <- ErrSlowClient
 		return
 	}
+	r.broadcastPresence()
+	r.sendCursorSnapshot(event.client)
 	event.reply <- nil
 }
 
@@ -333,6 +348,7 @@ func (r *Room) handleResume(event resumeEvent) {
 	}
 
 	message := r.resumeMessage(event.lastVersion)
+	message.Role = role
 	// Queue the initial state before registering the client so every later
 	// broadcast is ordered after the initial snapshot.
 	if !event.client.TrySend(message) {
@@ -342,6 +358,8 @@ func (r *Room) handleResume(event resumeEvent) {
 	}
 	r.clients[event.client] = struct{}{}
 	r.clientCount.Add(1)
+	r.broadcastPresence()
+	r.sendCursorSnapshot(event.client)
 	event.reply <- nil
 }
 
@@ -385,11 +403,163 @@ func (r *Room) handleReadDocument(event readDocumentEvent) {
 
 func (r *Room) handleLeave(event leaveEvent) {
 	if _, ok := r.clients[event.client]; ok {
+		r.removeCursor(event.client)
 		delete(r.clients, event.client)
 		r.clientCount.Add(-1)
 		event.client.Close(nil)
+		r.broadcastPresence()
 	}
 	event.reply <- struct{}{}
+}
+
+func (r *Room) handleCursor(event cursorEvent) {
+	if _, joined := r.clients[event.client]; !joined {
+		event.reply <- ErrRoomClosed
+		return
+	}
+	if !r.permissions[event.client.Identity()].CanRead() {
+		event.reply <- &CodedError{Code: protocol.CodePermissionDenied, Message: "read permission required"}
+		return
+	}
+	cursorClient, supported := event.client.(transport.CursorClient)
+	if !supported || !cursorClient.SupportsCursor() {
+		event.reply <- &CodedError{Code: protocol.CodeBadMessage, Message: "cursor presence is not supported"}
+		return
+	}
+	if previous, exists := r.cursors[event.client]; exists && event.cursor.Sequence <= previous.Sequence {
+		event.reply <- nil
+		return
+	}
+	transformed, err := r.transformCursor(event.cursor)
+	if err != nil {
+		event.reply <- err
+		return
+	}
+	transformed.UserID = event.client.Identity()
+	transformed.Username = cursorClient.DisplayName()
+	r.cursors[event.client] = transformed
+	r.broadcastCursor(protocol.Message{Type: protocol.TypeCursorChanged, DocID: r.docID, Cursor: &transformed}, event.client)
+	event.reply <- nil
+}
+
+func (r *Room) transformCursor(cursor protocol.CursorState) (protocol.CursorState, error) {
+	if cursor.Anchor < 0 || cursor.Head < 0 || cursor.Version > r.document.Version || cursor.Version < r.historyFloor {
+		return protocol.CursorState{}, &CodedError{Code: protocol.CodeBadMessage, Message: "cursor version or position is invalid"}
+	}
+	for _, applied := range r.history {
+		if applied.Version <= cursor.Version {
+			continue
+		}
+		cursor.Anchor = transformCursorPosition(cursor.Anchor, applied.Operation)
+		cursor.Head = transformCursorPosition(cursor.Head, applied.Operation)
+	}
+	cursor.Version = r.document.Version
+	contentLength := len([]rune(r.document.Content))
+	if cursor.Anchor > contentLength || cursor.Head > contentLength {
+		return protocol.CursorState{}, &CodedError{Code: protocol.CodeBadMessage, Message: "cursor position is outside document"}
+	}
+	return cursor, nil
+}
+
+func transformCursorPosition(position int, operation collab.Operation) int {
+	switch operation.Kind {
+	case collab.OperationInsert:
+		if operation.Position <= position {
+			return position + len([]rune(operation.Text))
+		}
+	case collab.OperationDelete:
+		end := operation.Position + operation.Length
+		if position >= end {
+			return position - operation.Length
+		}
+		if position > operation.Position {
+			return operation.Position
+		}
+	}
+	return position
+}
+
+func (r *Room) transformStoredCursors(operation collab.Operation) {
+	for client, cursor := range r.cursors {
+		cursor.Anchor = transformCursorPosition(cursor.Anchor, operation)
+		cursor.Head = transformCursorPosition(cursor.Head, operation)
+		cursor.Version = r.document.Version
+		r.cursors[client] = cursor
+		current := cursor
+		r.broadcastCursor(protocol.Message{Type: protocol.TypeCursorChanged, DocID: r.docID, Cursor: &current}, client)
+	}
+}
+
+func (r *Room) sendCursorSnapshot(client transport.Client) {
+	cursorClient, ok := client.(transport.CursorClient)
+	if !ok || !cursorClient.SupportsCursor() {
+		return
+	}
+	for owner, cursor := range r.cursors {
+		if owner == client {
+			continue
+		}
+		current := cursor
+		if !client.TrySend(protocol.Message{Type: protocol.TypeCursorChanged, DocID: r.docID, Cursor: &current}) {
+			r.disconnect(client, ErrSlowClient)
+			return
+		}
+	}
+}
+
+func (r *Room) broadcastCursor(message protocol.Message, except transport.Client) {
+	for client := range r.clients {
+		if client == except {
+			continue
+		}
+		cursorClient, ok := client.(transport.CursorClient)
+		if !ok || !cursorClient.SupportsCursor() {
+			continue
+		}
+		if !client.TrySend(message) {
+			r.disconnect(client, ErrSlowClient)
+		}
+	}
+}
+
+func (r *Room) removeCursor(client transport.Client) {
+	cursor, exists := r.cursors[client]
+	if !exists {
+		return
+	}
+	delete(r.cursors, client)
+	r.broadcastCursor(protocol.Message{Type: protocol.TypeCursorRemoved, DocID: r.docID, Cursor: &protocol.CursorState{UserID: cursor.UserID}}, client)
+}
+
+func (r *Room) broadcastPresence() {
+	for {
+		unique := make(map[string]struct{}, len(r.clients))
+		for client := range r.clients {
+			unique[client.Identity()] = struct{}{}
+		}
+		userIDs := make([]string, 0, len(unique))
+		for userID := range unique {
+			userIDs = append(userIDs, userID)
+		}
+		sort.Strings(userIDs)
+		message := protocol.Message{Type: protocol.TypePresenceChanged, DocID: r.docID, UserIDs: userIDs}
+		var slowClients []transport.Client
+		for client := range r.clients {
+			presenceClient, ok := client.(transport.PresenceClient)
+			if !ok || !presenceClient.SupportsPresence() {
+				continue
+			}
+			if !client.TrySend(message) {
+				slowClients = append(slowClients, client)
+			}
+		}
+		if len(slowClients) == 0 {
+			return
+		}
+		for _, client := range slowClients {
+			r.disconnect(client, ErrSlowClient)
+		}
+	}
 }
 
 func (r *Room) handleEdit(event editEvent) {
@@ -429,6 +599,7 @@ func (r *Room) handleEdit(event editEvent) {
 	r.document = nextDocument
 	r.history = append(r.history, applied)
 	r.broadcast(protocol.Message{Type: protocol.TypeEditApplied, RequestID: event.requestID, DocID: r.docID, Version: r.document.Version, Operation: &applied.Operation})
+	r.transformStoredCursors(applied.Operation)
 	r.maybeSaveSnapshot()
 	event.reply <- nil
 }
@@ -607,7 +778,7 @@ func (r *Room) versionedOperationsAfter(version uint64) []protocol.VersionedOper
 			operation.ID = ""
 			operation.UserID = ""
 			operation.BaseVersion = 0
-			operations = append(operations, protocol.VersionedOperation{Version: applied.Version, Operation: operation})
+			operations = append(operations, protocol.VersionedOperation{Version: applied.Version, RequestID: applied.ID, Operation: operation})
 		}
 	}
 	return operations
@@ -694,6 +865,7 @@ func (r *Room) broadcast(message protocol.Message) {
 
 func (r *Room) disconnect(client transport.Client, reason error) {
 	if _, exists := r.clients[client]; exists {
+		r.removeCursor(client)
 		delete(r.clients, client)
 		r.clientCount.Add(-1)
 	}
@@ -722,6 +894,8 @@ func (r *Room) rejectClosedEvent(roomEvent event) {
 	case leaveEvent:
 		current.reply <- struct{}{}
 	case editEvent:
+		current.reply <- ErrRoomClosed
+	case cursorEvent:
 		current.reply <- ErrRoomClosed
 	case permissionChangedEvent:
 		current.reply <- ErrRoomClosed

@@ -21,6 +21,7 @@ var (
 
 type Principal struct {
 	UserID    string
+	Username  string
 	SessionID string
 	Trusted   bool
 }
@@ -57,7 +58,7 @@ func developmentPrincipal(userID string) (Principal, error) {
 	if userID == "" {
 		return Principal{}, ErrMissingIdentity
 	}
-	return Principal{UserID: userID, Trusted: false}, nil
+	return Principal{UserID: userID, Username: userID, Trusted: false}, nil
 }
 
 func BearerToken(request *http.Request) (string, error) {
