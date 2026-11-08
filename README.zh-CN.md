@@ -2,22 +2,24 @@
 
 # 实时协作代码编辑器
 
-基于 Go、QUIC 和多节点 Ownership 的实时协作编辑后端。
+基于 Go、React、QUIC/WebSocket 和多节点 Ownership 的实时协作代码编辑器。
 
 ## 1. 项目介绍
 
-本项目实现了一个面向代码与纯文本场景的实时协作编辑后端，并提供可恢复的 CLI 客户端。客户端通过 REST 完成注册、登录、文档和权限管理，通过 QUIC 可靠有序 Stream 发送实时编辑消息。服务端使用 Operational Transformation（OT）处理并发 Insert/Delete，以单文档单 Room goroutine 串行维护内存状态，并在 MySQL 事务中持久化文档、权限、Operation Log、Snapshot 和 Fencing Token。
+本项目实现了一个面向代码与纯文本场景的实时协作编辑器，包含 React 浏览器界面和可恢复的 CLI 客户端。两类客户端都通过 REST 管理账户与文档；原生客户端使用 QUIC 可靠有序 Stream，浏览器则通过同进程 WebSocket Gateway 进入同一套 Room、OT、权限、Ownership 和持久化流程。服务端使用 Operational Transformation（OT）处理并发 Insert/Delete，以单文档单 Room goroutine 串行维护内存状态，并在 MySQL 事务中持久化文档、权限、Operation Log、Snapshot 和 Fencing Token。
 
 选择 QUIC 是为了在 UDP 之上获得 TLS 1.3、可靠有序 Stream、连接级超时与后续扩展空间，同时让实时传输与 REST 控制面保持独立。多节点架构用于避免单节点成为长期可用性瓶颈：etcd 负责 Membership 和基于 Lease 的 Ownership，Rendezvous Hashing 只选择优先候选节点，MySQL Fencing Token 最终阻止旧 Owner 继续写入。
 
-主要技术包括 Go、QUIC、MySQL、Redis、etcd、SQLite、JWT、mTLS、Prometheus 和 OpenTelemetry。当前后端、CLI 恢复链路、多节点接管和真实依赖集成测试已经完成；Docker 与 Google Cloud Terraform 配置已经准备，但尚未执行云端部署，也没有图形化前端。
+主要技术包括 Go、React、TypeScript、Monaco Editor、QUIC/WebSocket、MySQL、Redis、etcd、SQLite、JWT、mTLS、Prometheus 和 OpenTelemetry。当前后端、浏览器界面、CLI 恢复链路、多节点接管和真实依赖集成测试已经完成；Docker 与 Google Cloud Terraform 配置已经准备，但尚未执行云端部署。
 
 ## 2. 核心功能
 
 | 功能 | 技术实现 |
 | --- | --- |
-| 实时通信 | QUIC 可靠双向 Stream、TLS 1.3、ALPN、length-prefixed JSON |
+| 实时通信 | 原生客户端使用 QUIC，浏览器使用 WebSocket Gateway，共用协议与 Room 流程 |
+| 浏览器编辑器 | React、TypeScript、Monaco Editor、Zustand、IndexedDB Pending 恢复 |
 | 协作编辑 | Versioned Operational Transformation，支持 Insert/Delete |
+| 协作光标 | 经认证、感知 Version 的远程光标与选区，使用 Monaco Decoration 渲染 |
 | 节点发现 | etcd Membership、Lease 和 Watch |
 | 节点选择 | Rendezvous Hashing，仅用于选择优先候选节点 |
 | 所有权管理 | etcd Lease + Transaction，以及 `RECOVERING`/`ACTIVE` 状态 |
@@ -37,8 +39,10 @@
 ```mermaid
 flowchart TB
     Client[CLI 客户端]
+    Browser[React + Monaco 浏览器客户端]
     REST[REST API]
     QUIC[QUIC 实时传输<br/>UDP + TLS 1.3]
+    WS[WebSocket Gateway<br/>浏览器传输]
     Keyring[系统 Keyring]
     SQLite[(客户端 SQLite)]
     Obs[Prometheus + OpenTelemetry]
@@ -56,20 +60,25 @@ flowchart TB
 
     Client --> REST
     Client --> QUIC
+    Browser --> REST
+    Browser --> WS
     Client --> SQLite
     Client --> Keyring
     REST --> Nodes
     QUIC --> Nodes
+    WS --> Nodes
     Nodes --> RM
     RM --> Room
     Room --> OT
+    Browser -. 光标 / 选区 .-> WS
+    WS -. Room 临时广播 .-> Room
     Nodes <--> Etcd
     Room --> MySQL
     Nodes --> Redis
     Nodes --> Obs
 ```
 
-REST API 是认证、文档与权限管理的控制面；QUIC Transport 是实时编辑数据面。QUIC 客户端可以连接任意节点，节点根据 etcd 中的 Owner 信息处理请求或返回经过认证的 Owner Redirect。Owner-sensitive Permission 写入到达非 Owner 节点时，会通过内部 mTLS 转发到 Owner 节点重新鉴权并执行。
+REST API 是认证、文档与权限管理的控制面。QUIC 仍是原生客户端的实时数据面；浏览器 WebSocket Gateway 只把 JSON Frame 适配到同一个 Transport-neutral Room API，不复制协作逻辑。客户端可以连接任意节点，节点根据可信 etcd Membership 中的 Owner 信息处理请求或返回 Owner Redirect。Owner-sensitive Permission 写入到达非 Owner 节点时，会通过内部 mTLS 转发到 Owner 节点重新鉴权并执行。
 
 每个应用节点拥有独立的 Room Manager，用于创建、恢复和回收本节点持有 Ownership 的文档 Room。Room 只依赖 Transport 与 Storage 接口，不直接依赖 QUIC 或 SQL。MySQL 是文档和最终写入校验的权威来源，etcd 是节点与在线 Ownership 的权威来源，Redis 只管理 Session、Operation Lease、Presence 和跨节点撤销通知。客户端将文档版本与 Pending Edit 保存在 SQLite，将 Refresh Token 保存在 OS Keyring。
 
@@ -147,6 +156,14 @@ REST API 是认证、文档与权限管理的控制面；QUIC Transport 是实�
 
 **原因与保证：** 本地持久化必须先于网络发送，Refresh Token 不应保存在普通文件中。同一时刻只有一个 Reconnect Loop；ACK 与 Pending 删除在同一事务中原子提交，Token Rotation 使用稳定 Request ID 和加密 Replay Record。
 
+### 4.10 多人光标与选区
+
+**设计目的：** 展示其他已认证协作者的工作位置，同时避免把临时 Presence 写入文档历史。
+
+**实现流程：** 浏览器将 Monaco UTF-16 位置转换为 Unicode code-point offset，并发送经过节流和 Sequence 排序的 `cursor_update`。Owner Room 校验读取权限与 Version，通过保留的 OT History 转换旧位置，并在 `cursor_changed` 中广播服务端派生的用户身份。Monaco Decoration 使用稳定颜色渲染光标、用户名与选区；断开连接、页面离开、Session 撤销和本地过期都会清理 Decoration。
+
+**原因与保证：** Cursor 状态保存在单 goroutine Room 内，并与 Edit 一样遵循 Owner Redirect，但不会增加文档 Version，也不会写入 MySQL、Snapshot 或 Operation Log。已接受的 Edit 会转换已有 Cursor 位置；非法或与 ACK 交错产生的临时旧消息会被丢弃，不降低 Edit、Ownership 或 Fencing 校验强度。
+
 ## 5. 技术栈
 
 以下版本均来自当前仓库配置。
@@ -154,8 +171,10 @@ REST API 是认证、文档与权限管理的控制面；QUIC Transport 是实�
 | 类别 | 技术 | 当前版本或约束 |
 | --- | --- | --- |
 | 语言 | Go | language `1.26.0`，toolchain `1.26.10` |
+| 浏览器 UI | React / TypeScript / Vite | `19.3.1` / `6.0.3` / `8.3.6` |
+| 浏览器编辑器 | Monaco Editor / Zustand | `0.57.0` / `5.1.0` |
 | HTTP | Go `net/http` | 标准库 |
-| 实时传输 | `quic-go` | `v0.49.1`，TLS 1.3 |
+| 实时传输 | `quic-go` / `coder/websocket` | `v0.49.1` / `v1.8.15`；QUIC 使用 TLS 1.3 |
 | 数据库 | MySQL | 本地 `8.4.13`；Cloud SQL 目标 `MYSQL_8_4` |
 | Session / Presence | Redis | 本地 `7.4.5`；Memorystore 目标 `REDIS_7_2` |
 | 集群协调 | etcd | `3.5.17` |
@@ -194,6 +213,8 @@ internal/
     mysql/               # MySQL Transaction 与 Fencing 实现
   transport/            # Transport 接口
     quic/                # QUIC Framing、Client、Server、Connection 生命周期
+  websocket/            # 复用同一 Room Manager 的浏览器 Adapter
+frontend/               # React + TypeScript + Vite + Monaco 浏览器客户端
 migrations/             # MySQL Schema Migration
 deploy/gcp/              # Google Cloud Terraform 与启动模板
 docs/                    # 架构、运维、测试和部署报告
@@ -249,7 +270,19 @@ go run ./cmd/migrate
 go run ./cmd/server
 ```
 
-### 创建用户并启动客户端
+### 启动浏览器客户端
+
+Vite 开发服务器会把 REST 和 WebSocket 请求代理到 `localhost:8080`。Refresh Token 只保存在 HttpOnly、SameSite Cookie 中，Access Token 只保存在内存。
+
+```bash
+cd frontend
+npm ci
+npm run dev
+```
+
+访问 `http://127.0.0.1:5173`。生产构建使用 `npm run build`，并在已配置的 HTTPS Origin 下托管 `frontend/dist`。
+
+### 创建用户并启动 CLI 客户端
 
 先通过 REST 注册并登录，从响应中取得 Access Token 和 Refresh Token。不要把真实 Token 写入仓库或 Shell 脚本。
 
@@ -301,6 +334,7 @@ go build ./...
 
 - 单元测试覆盖 OT、Room 顺序、权限、协议、Framing、客户端状态机、配置和错误映射。
 - 集成测试使用真实 MySQL、Redis、etcd、TLS/mTLS、QUIC 和 SQLite，覆盖事务回滚、Fencing、Ownership 接管、跨节点 Logout、Snapshot + Replay、断线恢复和进程崩溃恢复。
+- 浏览器 E2E 使用真实 Go/MySQL/Redis 环境，覆盖双用户 OT、IndexedDB Pending 恢复、光标与选区、Owner Redirect、Fencing 故障接管和 Session 撤销。跨引擎测试覆盖 Chromium 141、Firefox 142 和 WebKit 26 的四种组合。
 - Race Detector 在 Package 并行执行条件下验证 Room、QUIC、Client、Session 与 Ownership 并发路径。
 - 未设置集成测试环境变量时，相关测试会明确 Skip；这种结果不能视为真实基础设施验证通过。变量包括 `MYSQL_TEST_DSN`、`REDIS_TEST_ADDR`、`REDIS_TEST_PASSWORD`、`ETCD_TEST_ENDPOINTS`、etcd TLS 文件，以及 `CLUSTER_TEST_*` 内部 mTLS 证书。
 - 完整隔离环境和无 Skip 的验收结果记录在 [最终质量 Gate](docs/operations/final-quality-gate.md) 与 [Phase 9.1 提交前审计](docs/operations/phase-9.1-pre-commit-audit.md)。
@@ -319,7 +353,7 @@ go build ./...
 
 ## 9. 部署
 
-仓库包含多阶段 Dockerfile、非 Root 运行用户、Health Check、基于 Compose 的本地依赖，以及 Google Cloud Terraform。目标云架构使用三台 Compute Engine 应用节点、三节点 etcd、私网 Cloud SQL MySQL HA、Memorystore Redis、Secret Manager、Cloud NAT、内部 mTLS 和 Monitoring。Terraform 已完成 `fmt`、`validate` 和离线 `plan`，计划结果为 75 add / 0 change / 0 destroy。
+仓库包含多阶段 Dockerfile、非 Root 运行用户、Health Check、基于 Compose 的本地依赖，以及 Google Cloud Terraform。目标云架构使用三台 Compute Engine 应用节点、三节点 etcd、私网 Cloud SQL MySQL HA、Memorystore Redis、Secret Manager、Cloud NAT、内部 mTLS 和 Monitoring。Terraform 已完成 `fmt`、`validate` 和离线 `plan`，计划结果为 56 add / 0 change / 0 destroy。
 
 **基础设施已经准备，尚未执行部署。** 没有运行 `terraform apply`，没有创建 Google Cloud 收费资源。正式部署前仍需准备真实证书与 Secret、受保护的远程 State Bucket、预算审批、镜像扫描和回滚窗口。
 
@@ -339,6 +373,15 @@ terraform -chdir=deploy/gcp plan -refresh=false
 | 文档 | 说明 |
 | --- | --- |
 | [最终代码审查](docs/architecture/final-code-review.md) | Phase 1–9.0 架构边界、调用链和审查结论 |
+| [前端架构](docs/frontend/phase-10.1-frontend-architecture.md) | 浏览器传输、认证、状态、恢复与集成设计 |
+| [浏览器 UI 报告](docs/frontend/phase-10.2-ui-report.md) | 已实现页面、组件边界、视觉检查与 UI 限制 |
+| [前后端集成报告](docs/frontend/phase-10.3-integration-report.md) | REST/WebSocket 兼容、恢复行为与 Phase 10 测试证据 |
+| [浏览器验收](docs/frontend/phase-10.4-acceptance-report.md) | 真实双浏览器与多节点验收结果 |
+| [光标设计](docs/frontend/phase-10.5-cursor-design.md) | Cursor 协议、OT 位置转换、生命周期与限流 |
+| [光标验收](docs/frontend/phase-10.5-acceptance-report.md) | 真实浏览器与跨节点 Cursor 验证 |
+| [浏览器兼容性](docs/frontend/phase-10.6-browser-compatibility.md) | Chromium、Firefox、WebKit 与原生 Safari 验证状态 |
+| [Phase 10.7 最终审查](docs/architecture/phase-10.7-final-review.md) | 后端、前端、分布式安全和可读性最终审查 |
+| [Phase 10.7 质量 Gate](docs/operations/phase-10.7-final-quality-gate.md) | 最终测试、安全、依赖、Docker 与 Terraform 验证 |
 | [系统审查](docs/architecture/phase-8.7-system-review.md) | 客户端恢复、多节点和持久化系统审查 |
 | [可读性重构](docs/architecture/readability-refactoring-report.md) | Clean Code 重构范围与兼容性说明 |
 | [最终质量 Gate](docs/operations/final-quality-gate.md) | 真实依赖测试与最终质量 Gate |
@@ -350,12 +393,13 @@ terraform -chdir=deploy/gcp plan -refresh=false
 
 ## 11. 当前限制
 
-- 暂无图形化前端；当前客户端以 CLI、协议验证和恢复测试为主。
+- 浏览器编辑器同步线性文本、光标、选区与在线参与者，但不支持富文本元数据。Cursor Presence 属于临时状态，Owner 故障接管后通过在线客户端重建，不做持久化。
+- Chromium、Firefox 与 Playwright WebKit 已自动化验收；本机安装了原生 Safari 26.5，但因 Safari Remote Automation 未启用而尚未验证，不能把 WebKit 结果视为原生 Safari 结果。
 - 一个 QUIC Connection 当前只承载一个文档和一个 bidirectional Stream；未启用 Datagram 或多文档 Stream Multiplexing。
-- OT 是线性文本 OT-lite，不是完整 CRDT，也未实现图形化编辑器所需的 Optimistic UI、光标同步和客户端多操作 Rebase。
+- OT 是线性文本 OT-lite，不是完整 CRDT。浏览器编辑会写入 IndexedDB 并按顺序重放，但复杂的客户端多操作 Rebase 仍有限制。
 - MySQL Operation Log 仍为追加写入，尚未实现长期归档策略。
 - 第一版多节点部署采用稳定节点身份，不包含自动扩缩容、自动证书签发或健康 Room 主动迁移。
 - Google Cloud 尚未部署；Terraform 验证不能替代真实配额、IAM、证书、DNS 和网络验证。
 - Phase 8.9 是短时小规模测试，不代表生产峰值容量、跨区域延迟或长期内存稳定性。
-- 最终容器镜像构建和镜像 CVE 扫描仍未验证，因为当时的审计环境无法稳定访问 Docker Hub Token Endpoint。
+- 生产镜像已完成构建，并验证了非 Root 运行与 Health Check；外部镜像 CVE 扫描仍属于部署前必做项。
 - 仓库尚未选择公开分发 License。
