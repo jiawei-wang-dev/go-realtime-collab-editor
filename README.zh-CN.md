@@ -22,38 +22,17 @@
 
 <img src="docs/assets/screenshots/dashboard.png" width="100%" alt="协作编辑器文档 Dashboard" />
 
-### 协作编辑器
+### 编辑与执行
 
-Monaco、文档 Version、连接状态、Pending Edit、在线参与者和受权限控制的操作集成在同一个 Workspace 中。
+核心 Workspace 在同一界面展示 Monaco、实时协作状态与远程光标，以及 Run 操作和真实 stdout、Exit Code、执行耗时。
 
-<img src="docs/assets/screenshots/collaborative-editor.png" width="100%" alt="Monaco 实时协作编辑器" />
+<img src="docs/assets/screenshots/go-code-execution.png" width="100%" alt="包含远程光标与 Go 成功执行输出的 Monaco 协作编辑器" />
 
-### Go 代码执行
+### 登录
 
-Owner 和 Writer 可以在隔离 Runner 中运行 Monaco 当前 Buffer，并查看 stdout、Exit Code 和执行耗时，不改变文档 Version。
-
-<img src="docs/assets/screenshots/go-code-execution.png" width="100%" alt="隔离 Go 代码执行成功" />
-
-### 实时多人协作
-
-两个独立且已认证的浏览器 Session 同时编辑一份文档。远程光标标签和选区属于临时 Room 状态，与 OT 内容 Operation 分离。
-
-<img src="docs/assets/screenshots/realtime-collaboration.png" width="100%" alt="双用户实时光标与选区同步" />
-
-### 执行错误处理
-
-编译器诊断与文档内容彼此分离，并以 stderr、非零 Exit Code 和实际耗时返回。
-
-<img src="docs/assets/screenshots/execution-error.png" width="100%" alt="输出控制台中的 Go 编译错误" />
-
-<details>
-<summary>认证页面</summary>
-
-浏览器流程使用内存中的 Access Token 和 HttpOnly、SameSite Refresh Cookie。
+登录页面展示产品视觉风格，同时确保密码完全遮蔽；Refresh 凭据保存在 HttpOnly、SameSite Cookie 中。
 
 <img src="docs/assets/screenshots/login.png" width="100%" alt="协作编辑器登录页面" />
-
-</details>
 
 ## 2. 核心功能
 

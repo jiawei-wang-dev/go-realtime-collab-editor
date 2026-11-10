@@ -22,38 +22,17 @@ The authenticated workspace lists accessible documents, versions, roles, search,
 
 <img src="docs/assets/screenshots/dashboard.png" width="100%" alt="Collaborative editor document dashboard" />
 
-### Collaborative Editor
+### Editor & Execution
 
-Monaco, document version state, connection health, pending edits, participants, and permission-aware actions share one focused workspace.
+The core workspace combines Monaco, live collaboration state and a remote cursor with the Run action and its real stdout, exit code, and elapsed time.
 
-<img src="docs/assets/screenshots/collaborative-editor.png" width="100%" alt="Monaco collaborative editor workspace" />
+<img src="docs/assets/screenshots/go-code-execution.png" width="100%" alt="Monaco collaborative editor with remote cursor and successful Go execution output" />
 
-### Go Code Execution
+### Login
 
-Owners and writers can run the current Monaco buffer in the isolated Runner and inspect stdout, exit code, and elapsed time without changing the document version.
-
-<img src="docs/assets/screenshots/go-code-execution.png" width="100%" alt="Successful isolated Go code execution" />
-
-### Real-time Collaboration
-
-Two independent authenticated browser sessions edit the same document. The remote cursor label and selection are ephemeral Room state, separate from OT content operations.
-
-<img src="docs/assets/screenshots/realtime-collaboration.png" width="100%" alt="Two-user real-time cursor and selection synchronization" />
-
-### Execution Error Handling
-
-Compiler diagnostics remain separate from document content and are returned as stderr with a non-zero exit code and measured duration.
-
-<img src="docs/assets/screenshots/execution-error.png" width="100%" alt="Go compiler error shown in the output console" />
-
-<details>
-<summary>Authentication screen</summary>
-
-The browser flow uses an in-memory access token and an HttpOnly, SameSite refresh cookie.
+The sign-in screen presents the product's visual identity while keeping the password fully masked; refresh credentials remain in an HttpOnly, SameSite cookie.
 
 <img src="docs/assets/screenshots/login.png" width="100%" alt="Collaborative editor sign-in screen" />
-
-</details>
 
 ## 2. Key Features
 
