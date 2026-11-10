@@ -2,7 +2,9 @@
 
 # 实时协作代码编辑器
 
-基于 Go、React、QUIC/WebSocket 和多节点 Ownership 的实时协作代码编辑器。
+具备多节点 Ownership、可靠同步与隔离 Go 代码执行能力的分布式实时协作代码编辑器。
+
+![Go](https://img.shields.io/badge/Go-1.26.10-00ADD8?logo=go&logoColor=white) ![React](https://img.shields.io/badge/React-19.3.1-61DAFB?logo=react&logoColor=111827) ![TypeScript](https://img.shields.io/badge/TypeScript-6.0.3-3178C6?logo=typescript&logoColor=white) ![Monaco Editor](https://img.shields.io/badge/Monaco_Editor-0.57.0-007ACC?logo=visualstudiocode&logoColor=white) ![QUIC](https://img.shields.io/badge/QUIC-TLS_1.3-6D7CFF) ![WebSocket](https://img.shields.io/badge/WebSocket-Browser_Gateway-4B5563) ![MySQL](https://img.shields.io/badge/MySQL-8.4.13-4479A1?logo=mysql&logoColor=white) ![Redis](https://img.shields.io/badge/Redis-7.4.5-DC382D?logo=redis&logoColor=white) ![etcd](https://img.shields.io/badge/etcd-3.5.17-419EDA?logo=etcd&logoColor=white) ![Docker](https://img.shields.io/badge/Docker-Isolated_Runner-2496ED?logo=docker&logoColor=white)
 
 ## 1. 项目介绍
 
@@ -12,12 +14,54 @@
 
 主要技术包括 Go、React、TypeScript、Monaco Editor、QUIC/WebSocket、MySQL、Redis、etcd、SQLite、JWT、mTLS、Prometheus 和 OpenTelemetry。当前后端、浏览器界面、CLI 恢复链路、多节点接管和真实依赖集成测试已经完成；Docker 与 Google Cloud Terraform 配置已经准备，但尚未执行云端部署。
 
+## 项目截图
+
+### Dashboard
+
+登录后的 Workspace 展示当前可访问文档、Version、Role、搜索与文档创建，不会将 Session 凭据写入浏览器存储。
+
+<img src="docs/assets/screenshots/dashboard.png" width="100%" alt="协作编辑器文档 Dashboard" />
+
+### 协作编辑器
+
+Monaco、文档 Version、连接状态、Pending Edit、在线参与者和受权限控制的操作集成在同一个 Workspace 中。
+
+<img src="docs/assets/screenshots/collaborative-editor.png" width="100%" alt="Monaco 实时协作编辑器" />
+
+### Go 代码执行
+
+Owner 和 Writer 可以在隔离 Runner 中运行 Monaco 当前 Buffer，并查看 stdout、Exit Code 和执行耗时，不改变文档 Version。
+
+<img src="docs/assets/screenshots/go-code-execution.png" width="100%" alt="隔离 Go 代码执行成功" />
+
+### 实时多人协作
+
+两个独立且已认证的浏览器 Session 同时编辑一份文档。远程光标标签和选区属于临时 Room 状态，与 OT 内容 Operation 分离。
+
+<img src="docs/assets/screenshots/realtime-collaboration.png" width="100%" alt="双用户实时光标与选区同步" />
+
+### 执行错误处理
+
+编译器诊断与文档内容彼此分离，并以 stderr、非零 Exit Code 和实际耗时返回。
+
+<img src="docs/assets/screenshots/execution-error.png" width="100%" alt="输出控制台中的 Go 编译错误" />
+
+<details>
+<summary>认证页面</summary>
+
+浏览器流程使用内存中的 Access Token 和 HttpOnly、SameSite Refresh Cookie。
+
+<img src="docs/assets/screenshots/login.png" width="100%" alt="协作编辑器登录页面" />
+
+</details>
+
 ## 2. 核心功能
 
 | 功能 | 技术实现 |
 | --- | --- |
 | 实时通信 | 原生客户端使用 QUIC，浏览器使用 WebSocket Gateway，共用协议与 Room 流程 |
 | 浏览器编辑器 | React、TypeScript、Monaco Editor、Zustand、IndexedDB Pending 恢复 |
+| Go 代码运行 | 将 Monaco 当前文本交给经认证的 Docker 隔离 Runner 执行 |
 | 协作编辑 | Versioned Operational Transformation，支持 Insert/Delete |
 | 协作光标 | 经认证、感知 Version 的远程光标与选区，使用 Monaco Decoration 渲染 |
 | 节点发现 | etcd Membership、Lease 和 Watch |
@@ -43,9 +87,12 @@ flowchart TB
     REST[REST API]
     QUIC[QUIC 实时传输<br/>UDP + TLS 1.3]
     WS[WebSocket Gateway<br/>浏览器传输]
+    ExecAPI[执行 API<br/>认证 + 权限 + 限制]
     Keyring[系统 Keyring]
     SQLite[(客户端 SQLite)]
     Obs[Prometheus + OpenTelemetry]
+    Runner[执行 Runner<br/>经认证的 Unix Socket]
+    Sandbox[临时 Go Sandbox<br/>非 Root + 无网络]
 
     subgraph Cluster[应用节点集群]
         Nodes[Node A / Node B / Node C<br/>REST + QUIC]
@@ -62,6 +109,7 @@ flowchart TB
     Client --> QUIC
     Browser --> REST
     Browser --> WS
+    Browser -->|运行 Monaco 当前 Buffer| ExecAPI
     Client --> SQLite
     Client --> Keyring
     REST --> Nodes
@@ -76,11 +124,15 @@ flowchart TB
     Room --> MySQL
     Nodes --> Redis
     Nodes --> Obs
+    ExecAPI --> Runner
+    Runner --> Sandbox
 ```
 
 REST API 是认证、文档与权限管理的控制面。QUIC 仍是原生客户端的实时数据面；浏览器 WebSocket Gateway 只把 JSON Frame 适配到同一个 Transport-neutral Room API，不复制协作逻辑。客户端可以连接任意节点，节点根据可信 etcd Membership 中的 Owner 信息处理请求或返回 Owner Redirect。Owner-sensitive Permission 写入到达非 Owner 节点时，会通过内部 mTLS 转发到 Owner 节点重新鉴权并执行。
 
 每个应用节点拥有独立的 Room Manager，用于创建、恢复和回收本节点持有 Ownership 的文档 Room。Room 只依赖 Transport 与 Storage 接口，不直接依赖 QUIC 或 SQL。MySQL 是文档和最终写入校验的权威来源，etcd 是节点与在线 Ownership 的权威来源，Redis 只管理 Session、Operation Lease、Presence 和跨节点撤销通知。客户端将文档版本与 Pending Edit 保存在 SQLite，将 Refresh Token 保存在 OS Keyring。
+
+Go 代码执行与协作数据链路完全分离：`Execution API → Runner → Sandbox` 不进入 Room、OT、Snapshot 或 MySQL Operation Log。API 先认证用户、校验 `owner`/`write` 权限并执行用户级和节点级限制，再通过经认证的 Unix Socket 将 Monaco 当前 Buffer 交给独立 Runner。只有 Runner 能调用 Docker。每次请求使用一个无网络、非 Root 的临时容器；源码和输出不会持久化，也不改变文档 Version。
 
 ## 4. 核心设计
 
@@ -196,6 +248,7 @@ cmd/                    # 可执行程序
   admin/                # 管理工具
   loadtest/             # REST + QUIC 压测工具
   healthcheck/          # 容器健康检查
+  runner/               # 隔离 Go 执行服务，唯一可调用 Docker 的组件
 internal/
   api/                  # REST、认证中间件、跨节点 mTLS forwarding
   authentication/       # JWT、Redis Session、Rotation、Presence、Revocation
@@ -204,6 +257,7 @@ internal/
     etcd/                # etcd Registry、Lease、Ownership、Failover
     rpc/                 # 内部 mTLS RPC
   collab/               # 文档 Operation 与 OT
+  execution/            # Runner 契约、Unix Socket Client/Server 和 Docker Sandbox
   config/               # 环境配置与安全校验
   migration/            # 有序、可恢复的 Migration runner
   observability/        # 日志、Metrics、Tracing、Health
@@ -282,6 +336,24 @@ npm run dev
 
 访问 `http://127.0.0.1:5173`。生产构建使用 `npm run build`，并在已配置的 HTTPS Origin 下托管 `frontend/dist`。
 
+### 启动可选 Go Runner
+
+Run 按钮需要单独的本地 Runner。公网 API 进程不得获取 Docker Socket。两个进程只通过环境变量共享随机生成的内部 Token，并使用权限为 `0600` 的 Unix Socket 通信。
+
+```bash
+docker pull golang:1.26.10-bookworm
+export RUNNER_SOCKET=/tmp/collab-editor-runner.sock
+export RUNNER_TOKEN="$(openssl rand -hex 32)"
+go build -o /tmp/collab-runner ./cmd/runner
+go build -o /tmp/collab-server ./cmd/server
+/tmp/collab-runner &
+runner_pid=$!
+/tmp/collab-server
+kill "$runner_pid"
+```
+
+`cmd/runner` 每次请求创建一个临时容器，并强制无网络、只读 RootFS、UID/GID 65532、移除全部 Capability、`no-new-privileges`、有界 tmpfs、512 MB 内存、1 CPU、64 PID、10 秒超时和 stdout/stderr 合计 64 KB 上限。Runner 只接受单个 Go 源文件，并使用 `GOPROXY=off` 和 `GOSUMDB=off` 禁止下载 Module。配置与部署边界详见 [Go 执行 Runner](docs/operations/go-execution-runner.md)。
+
 ### 创建用户并启动 CLI 客户端
 
 先通过 REST 注册并登录，从响应中取得 Access Token 和 Refresh Token。不要把真实 Token 写入仓库或 Shell 脚本。
@@ -335,6 +407,7 @@ go build ./...
 - 单元测试覆盖 OT、Room 顺序、权限、协议、Framing、客户端状态机、配置和错误映射。
 - 集成测试使用真实 MySQL、Redis、etcd、TLS/mTLS、QUIC 和 SQLite，覆盖事务回滚、Fencing、Ownership 接管、跨节点 Logout、Snapshot + Replay、断线恢复和进程崩溃恢复。
 - 浏览器 E2E 使用真实 Go/MySQL/Redis 环境，覆盖双用户 OT、IndexedDB Pending 恢复、光标与选区、Owner Redirect、Fencing 故障接管和 Session 撤销。跨引擎测试覆盖 Chromium 141、Firefox 142 和 WebKit 26 的四种组合。
+- Go 执行测试使用固定的真实 Docker 镜像，验证编译、panic、超时、网络与宿主机路径隔离、Memory/CPU/PID 参数、输出截断、容器清理、并发隔离、浏览器输出和 Viewer 拒绝。使用 `RUN_DOCKER_INTEGRATION=true go test -count=1 -run TestDockerRunnerRealSandbox -v ./internal/execution` 显式运行；Skip 不能计为 Docker Sandbox PASS。
 - Race Detector 在 Package 并行执行条件下验证 Room、QUIC、Client、Session 与 Ownership 并发路径。
 - 未设置集成测试环境变量时，相关测试会明确 Skip；这种结果不能视为真实基础设施验证通过。变量包括 `MYSQL_TEST_DSN`、`REDIS_TEST_ADDR`、`REDIS_TEST_PASSWORD`、`ETCD_TEST_ENDPOINTS`、etcd TLS 文件，以及 `CLUSTER_TEST_*` 内部 mTLS 证书。
 - 完整隔离环境和无 Skip 的验收结果记录在 [最终质量 Gate](docs/operations/final-quality-gate.md) 与 [Phase 9.1 提交前审计](docs/operations/phase-9.1-pre-commit-audit.md)。
@@ -382,6 +455,7 @@ terraform -chdir=deploy/gcp plan -refresh=false
 | [浏览器兼容性](docs/frontend/phase-10.6-browser-compatibility.md) | Chromium、Firefox、WebKit 与原生 Safari 验证状态 |
 | [Phase 10.7 最终审查](docs/architecture/phase-10.7-final-review.md) | 后端、前端、分布式安全和可读性最终审查 |
 | [Phase 10.7 质量 Gate](docs/operations/phase-10.7-final-quality-gate.md) | 最终测试、安全、依赖、Docker 与 Terraform 验证 |
+| [Go 执行 Runner](docs/operations/go-execution-runner.md) | Phase 10.9 API、隔离边界、资源限制、启动和测试 |
 | [系统审查](docs/architecture/phase-8.7-system-review.md) | 客户端恢复、多节点和持久化系统审查 |
 | [可读性重构](docs/architecture/readability-refactoring-report.md) | Clean Code 重构范围与兼容性说明 |
 | [最终质量 Gate](docs/operations/final-quality-gate.md) | 真实依赖测试与最终质量 Gate |
@@ -394,6 +468,8 @@ terraform -chdir=deploy/gcp plan -refresh=false
 ## 11. 当前限制
 
 - 浏览器编辑器同步线性文本、光标、选区与在线参与者，但不支持富文本元数据。Cursor Presence 属于临时状态，Owner 故障接管后通过在线客户端重建，不做持久化。
+- 浏览器执行只支持单个 Go 源文件和标准库，不提供 Shell、Terminal、多文件 Workspace、第三方 Module 下载或其他语言。标准库冷编译时间也计入 10 秒上限。
+- 本地 Runner 使用宿主机 Docker Daemon，但公网 API 永远不获取 Docker 权限。生产发布需要单独加固的 Runner 主机/服务，当前 Google Cloud Terraform 不包含这部分。
 - Chromium、Firefox 与 Playwright WebKit 已自动化验收；本机安装了原生 Safari 26.5，但因 Safari Remote Automation 未启用而尚未验证，不能把 WebKit 结果视为原生 Safari 结果。
 - 一个 QUIC Connection 当前只承载一个文档和一个 bidirectional Stream；未启用 Datagram 或多文档 Stream Multiplexing。
 - OT 是线性文本 OT-lite，不是完整 CRDT。浏览器编辑会写入 IndexedDB 并按顺序重放，但复杂的客户端多操作 Rebase 仍有限制。

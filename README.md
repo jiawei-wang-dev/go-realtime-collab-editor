@@ -2,7 +2,9 @@
 
 # Realtime Collaborative Code Editor
 
-A real-time collaborative code editor with a Go backend, browser UI, QUIC, and multi-node ownership.
+A distributed real-time collaborative code editor with multi-node ownership, reliable synchronization, and isolated Go code execution.
+
+![Go](https://img.shields.io/badge/Go-1.26.10-00ADD8?logo=go&logoColor=white) ![React](https://img.shields.io/badge/React-19.3.1-61DAFB?logo=react&logoColor=111827) ![TypeScript](https://img.shields.io/badge/TypeScript-6.0.3-3178C6?logo=typescript&logoColor=white) ![Monaco Editor](https://img.shields.io/badge/Monaco_Editor-0.57.0-007ACC?logo=visualstudiocode&logoColor=white) ![QUIC](https://img.shields.io/badge/QUIC-TLS_1.3-6D7CFF) ![WebSocket](https://img.shields.io/badge/WebSocket-Browser_Gateway-4B5563) ![MySQL](https://img.shields.io/badge/MySQL-8.4.13-4479A1?logo=mysql&logoColor=white) ![Redis](https://img.shields.io/badge/Redis-7.4.5-DC382D?logo=redis&logoColor=white) ![etcd](https://img.shields.io/badge/etcd-3.5.17-419EDA?logo=etcd&logoColor=white) ![Docker](https://img.shields.io/badge/Docker-Isolated_Runner-2496ED?logo=docker&logoColor=white)
 
 ## 1. Project Overview
 
@@ -12,12 +14,54 @@ QUIC provides TLS 1.3, reliable ordered streams, connection-level timeouts, and 
 
 The main stack is Go, React, TypeScript, Monaco Editor, QUIC/WebSocket, MySQL, Redis, etcd, SQLite, JWT, mTLS, Prometheus, and OpenTelemetry. The backend, browser UI, CLI recovery path, multi-node failover, and real-dependency integration tests are implemented. Docker and Google Cloud Terraform assets are prepared, but no cloud deployment has been performed.
 
+## Screenshots
+
+### Dashboard
+
+The authenticated workspace lists accessible documents, versions, roles, search, and document creation without exposing session credentials to browser storage.
+
+<img src="docs/assets/screenshots/dashboard.png" width="100%" alt="Collaborative editor document dashboard" />
+
+### Collaborative Editor
+
+Monaco, document version state, connection health, pending edits, participants, and permission-aware actions share one focused workspace.
+
+<img src="docs/assets/screenshots/collaborative-editor.png" width="100%" alt="Monaco collaborative editor workspace" />
+
+### Go Code Execution
+
+Owners and writers can run the current Monaco buffer in the isolated Runner and inspect stdout, exit code, and elapsed time without changing the document version.
+
+<img src="docs/assets/screenshots/go-code-execution.png" width="100%" alt="Successful isolated Go code execution" />
+
+### Real-time Collaboration
+
+Two independent authenticated browser sessions edit the same document. The remote cursor label and selection are ephemeral Room state, separate from OT content operations.
+
+<img src="docs/assets/screenshots/realtime-collaboration.png" width="100%" alt="Two-user real-time cursor and selection synchronization" />
+
+### Execution Error Handling
+
+Compiler diagnostics remain separate from document content and are returned as stderr with a non-zero exit code and measured duration.
+
+<img src="docs/assets/screenshots/execution-error.png" width="100%" alt="Go compiler error shown in the output console" />
+
+<details>
+<summary>Authentication screen</summary>
+
+The browser flow uses an in-memory access token and an HttpOnly, SameSite refresh cookie.
+
+<img src="docs/assets/screenshots/login.png" width="100%" alt="Collaborative editor sign-in screen" />
+
+</details>
+
 ## 2. Key Features
 
 | Feature | Implementation |
 | --- | --- |
 | Real-time Communication | QUIC for native clients; WebSocket gateway for browsers; one shared protocol and Room path |
 | Browser Editor | React, TypeScript, Monaco Editor, Zustand, IndexedDB pending recovery |
+| Go Code Execution | Live Monaco source executed by an authenticated, Docker-isolated Runner |
 | Collaborative Editing | Versioned Operational Transformation with Insert/Delete |
 | Collaborative Presence | Authenticated, version-aware remote cursors and selections rendered with Monaco decorations |
 | Node Discovery | etcd membership, leases, and watches |
@@ -43,9 +87,12 @@ flowchart TB
     REST[REST API]
     QUIC[QUIC Transport<br/>UDP + TLS 1.3]
     WS[WebSocket Gateway<br/>Browser Transport]
+    ExecAPI[Execution API<br/>Auth + Permission + Limits]
     Keyring[OS Keyring]
     SQLite[(Client SQLite)]
     Obs[Prometheus + OpenTelemetry]
+    Runner[Execution Runner<br/>Authenticated Unix Socket]
+    Sandbox[Ephemeral Go Sandbox<br/>non-root + no network]
 
     subgraph Cluster[Application Nodes]
         Nodes[Node A / Node B / Node C<br/>REST + QUIC]
@@ -62,6 +109,7 @@ flowchart TB
     Client --> QUIC
     Browser --> REST
     Browser --> WS
+    Browser -->|Run current Monaco buffer| ExecAPI
     Client --> SQLite
     Client --> Keyring
     REST --> Nodes
@@ -76,11 +124,15 @@ flowchart TB
     Room --> MySQL
     Nodes --> Redis
     Nodes --> Obs
+    ExecAPI --> Runner
+    Runner --> Sandbox
 ```
 
 The REST API is the control plane for authentication, documents, and permissions. QUIC remains the native real-time data plane, while the browser WebSocket gateway adapts JSON frames to the same transport-neutral Room API; it does not duplicate collaboration logic. A client may connect to any node, which either serves the document or returns an owner redirect based on trusted etcd membership. When an owner-sensitive permission write reaches a non-owner node, the node forwards it over internal mTLS so the owner can reauthenticate and execute it.
 
 Each application node has its own Room Manager, which creates, recovers, and retires Rooms owned by that node. A Room depends only on transport and storage interfaces, not directly on QUIC or SQL. MySQL is authoritative for documents and final write validation, etcd is authoritative for live nodes and ownership, and Redis is limited to sessions, operation leases, presence, and cross-node revocation. The client stores document versions and pending edits in SQLite, while refresh tokens remain in the OS keyring.
+
+Go execution is deliberately outside the collaboration data path: `Execution API → Runner → Sandbox` never enters Room, OT, Snapshot, or MySQL Operation Log. The API authenticates the user, verifies `owner`/`write` permission, applies per-user and per-node limits, and sends the current Monaco buffer to a separate Runner over an authenticated Unix socket. Only that Runner can invoke Docker. Each request gets a disposable, non-root, network-disabled container; source and output are never persisted and do not change the document version.
 
 ## 4. Core Design
 
@@ -196,6 +248,7 @@ cmd/                    # Executables
   admin/                # Administrative utility
   loadtest/             # REST + QUIC load generator
   healthcheck/          # Container health probe
+  runner/               # Isolated Go execution service; the only Docker owner
 internal/
   api/                  # REST, authentication middleware, cross-node mTLS forwarding
   authentication/       # JWT, Redis sessions, rotation, presence, and revocation
@@ -204,6 +257,7 @@ internal/
     etcd/                # etcd registry, leases, ownership, and failover
     rpc/                 # Internal mTLS RPC
   collab/               # Document operations and OT
+  execution/            # Runner contract, Unix-socket client/server, Docker sandbox
   config/               # Environment configuration and security validation
   migration/            # Ordered, recoverable migration runner
   observability/        # Logs, metrics, tracing, and health
@@ -282,6 +336,24 @@ npm run dev
 
 Open `http://127.0.0.1:5173`. For a production build, run `npm run build` and serve `frontend/dist` behind the configured HTTPS origin.
 
+### Start the Optional Go Runner
+
+The Run button requires a separate local Runner. The public API process must not receive the Docker socket. Both processes share a randomly generated internal token only through their environment and communicate through a mode-`0600` Unix socket.
+
+```bash
+docker pull golang:1.26.10-bookworm
+export RUNNER_SOCKET=/tmp/collab-editor-runner.sock
+export RUNNER_TOKEN="$(openssl rand -hex 32)"
+go build -o /tmp/collab-runner ./cmd/runner
+go build -o /tmp/collab-server ./cmd/server
+/tmp/collab-runner &
+runner_pid=$!
+/tmp/collab-server
+kill "$runner_pid"
+```
+
+`cmd/runner` creates one disposable container per request with no network, a read-only root filesystem, UID/GID 65532, all capabilities removed, `no-new-privileges`, bounded tmpfs storage, 512 MB memory, 1 CPU, 64 PIDs, a 10-second timeout, and a combined 64 KB output limit. It accepts only a single Go source file and disables module downloads with `GOPROXY=off` and `GOSUMDB=off`. See [Go Execution Runner](docs/operations/go-execution-runner.md) for configuration and deployment boundaries.
+
 ### Register and Start the CLI Client
 
 Register and log in through REST, then obtain the access and refresh tokens from the response. Do not store real tokens in the repository or a shell script.
@@ -335,6 +407,7 @@ go build ./...
 - Unit tests cover OT, Room ordering, permissions, protocol handling, framing, the client state machine, configuration, and error mapping.
 - Integration tests use real MySQL, Redis, etcd, TLS/mTLS, QUIC, and SQLite to verify rollback, fencing, ownership takeover, cross-node logout, Snapshot + Replay, reconnect, and process-crash recovery.
 - Browser E2E tests use real Go/MySQL/Redis environments to verify two-user OT, IndexedDB pending recovery, cursor/selection presence, Owner Redirect, fencing failover, and session revocation. Cross-engine runs cover Chromium 141, Firefox 142, and WebKit 26 in four pairings.
+- Go execution tests use the pinned real Docker image to verify compilation, panic handling, timeouts, network and host-path isolation, memory/CPU/PID arguments, output truncation, cleanup, concurrent isolation, browser output, and Viewer rejection. Run them explicitly with `RUN_DOCKER_INTEGRATION=true go test -count=1 -run TestDockerRunnerRealSandbox -v ./internal/execution`; a skipped result is not a Docker sandbox pass.
 - The Race Detector exercises concurrent Room, QUIC, Client, Session, and Ownership paths with package-level parallelism enabled.
 - Integration tests explicitly skip when their environment variables are absent; a skipped result is not treated as real-infrastructure validation. Required values include `MYSQL_TEST_DSN`, `REDIS_TEST_ADDR`, `REDIS_TEST_PASSWORD`, `ETCD_TEST_ENDPOINTS`, etcd TLS files, and the `CLUSTER_TEST_*` internal mTLS certificates.
 - The isolated, no-skip validation procedure and results are documented in [Final Quality Gate](docs/operations/final-quality-gate.md) and [Phase 9.1 Audit](docs/operations/phase-9.1-pre-commit-audit.md).
@@ -382,6 +455,7 @@ Do not apply without an approved plan, budget, and rollback procedure.
 | [Browser Compatibility](docs/frontend/phase-10.6-browser-compatibility.md) | Chromium, Firefox, WebKit, and native Safari verification status |
 | [Phase 10.7 Final Review](docs/architecture/phase-10.7-final-review.md) | Final backend, frontend, distributed-safety, and readability audit |
 | [Phase 10.7 Quality Gate](docs/operations/phase-10.7-final-quality-gate.md) | Final test, security, dependency, Docker, and Terraform validation |
+| [Go Execution Runner](docs/operations/go-execution-runner.md) | Phase 10.9 API, isolation boundary, resource limits, startup, and tests |
 | [System Review](docs/architecture/phase-8.7-system-review.md) | Client recovery, multi-node, and persistence review |
 | [Readability Refactoring](docs/architecture/readability-refactoring-report.md) | Readability refactoring scope and compatibility notes |
 | [Final Quality Gate](docs/operations/final-quality-gate.md) | Real-dependency tests and final quality gates |
@@ -394,6 +468,8 @@ Do not apply without an approved plan, budget, and rollback procedure.
 ## 11. Current Limitations
 
 - The browser editor synchronizes linear-text edits, cursors, selections, and online participants, but not rich-text metadata. Cursor presence is ephemeral and is rebuilt after Owner failover rather than persisted.
+- Browser execution supports one Go source file and the standard library only. It does not provide a shell, terminal, multi-file workspace, third-party module download, or other languages. Cold standard-library compilation counts toward the 10-second limit.
+- The local Runner uses the host Docker daemon, but the public API never receives Docker access. A production rollout requires a separately hardened Runner host/service and is not included in the current Google Cloud Terraform.
 - Chromium, Firefox, and Playwright WebKit are automated. Native Safari 26.5 is installed but remains unverified because Safari remote automation is disabled; WebKit is not reported as native Safari.
 - One QUIC connection currently carries one document over one bidirectional stream; datagrams and multi-document stream multiplexing are not enabled.
 - OT is a linear-text OT-lite implementation, not a full CRDT. Browser edits are stored in IndexedDB and replayed sequentially; complex client-side multi-operation rebasing remains limited.
