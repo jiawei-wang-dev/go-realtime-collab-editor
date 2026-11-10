@@ -1,6 +1,7 @@
 import { create } from 'zustand'
 import type { ConnectionState } from '../types/protocol'
 import type { PermissionRole } from '../types/api'
+import type { RealtimeTransportKind } from '../services/realtimeTransport'
 
 interface CollaborationState {
   loading: boolean
@@ -9,6 +10,7 @@ interface CollaborationState {
   version: number
   role: PermissionRole | ''
   connection: ConnectionState
+  transport: RealtimeTransportKind | ''
   synchronized: boolean
   participants: string[]
   pendingCount: number
@@ -16,6 +18,7 @@ interface CollaborationState {
   beginLoad: (documentId: string) => void
   initialize: (documentId: string, content: string, version: number) => void
   setConnection: (connection: ConnectionState) => void
+  setTransport: (transport: RealtimeTransportKind) => void
   setDocument: (content: string, version: number) => void
   setRole: (role: PermissionRole) => void
   setParticipants: (participants: string[]) => void
@@ -31,6 +34,7 @@ const initialState = {
   version: 0,
   role: '' as const,
   connection: 'DISCONNECTED' as const,
+  transport: '' as const,
   synchronized: false,
   participants: [] as string[],
   pendingCount: 0,
@@ -42,6 +46,7 @@ export const useCollaborationStore = create<CollaborationState>((set) => ({
   beginLoad: (documentId) => set({ ...initialState, documentId, loading: true }),
   initialize: (documentId, content, version) => set({ documentId, content, version, synchronized: true, error: '', loading: false }),
   setConnection: (connection) => set({ connection, synchronized: connection === 'CONNECTED' }),
+  setTransport: (transport) => set({ transport }),
   setDocument: (content, version) => set({ content, version }),
   setRole: (role) => set({ role }),
   setParticipants: (participants) => set({ participants }),

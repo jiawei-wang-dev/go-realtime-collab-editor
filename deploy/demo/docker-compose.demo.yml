@@ -1,0 +1,217 @@
+name: collab-demo
+
+services:
+  mysql:
+    image: mysql:8.4.13
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?set MYSQL_ROOT_PASSWORD}
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-collab_editor}
+      MYSQL_USER: ${MYSQL_USER:-collab}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:?set MYSQL_PASSWORD}
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_bin
+    volumes:
+      - mysql-data:/var/lib/mysql
+    networks:
+      - data
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping --host=127.0.0.1 --user=root --password=\"$${MYSQL_ROOT_PASSWORD}\" --silent"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 20s
+    security_opt:
+      - no-new-privileges:true
+
+  redis:
+    image: redis:7.4.5-alpine
+    restart: unless-stopped
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?set REDIS_PASSWORD}
+    command: ["/bin/sh", "-c", "exec redis-server --appendonly yes --appendfsync everysec --requirepass \"$${REDIS_PASSWORD}\""]
+    volumes:
+      - redis-data:/data
+    networks:
+      - data
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli --no-auth-warning -a \"$${REDIS_PASSWORD}\" ping | grep -qx PONG"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    security_opt:
+      - no-new-privileges:true
+
+  runner-volume-init:
+    image: alpine:3.22.2
+    user: "0:0"
+    command: ["/bin/sh", "-c", "chown 10001:10001 /run/collab && chmod 0700 /run/collab"]
+    volumes:
+      - runner-socket:/run/collab
+    network_mode: none
+    restart: "no"
+    security_opt:
+      - no-new-privileges:true
+
+  runner:
+    build:
+      context: ../..
+      dockerfile: deploy/demo/Dockerfile.runner
+    restart: unless-stopped
+    user: "10001:10001"
+    group_add:
+      - ${DOCKER_GID:?set DOCKER_GID}
+    environment:
+      RUNNER_SOCKET: /run/collab/runner.sock
+      RUNNER_TOKEN: ${RUNNER_TOKEN:?set RUNNER_TOKEN}
+      RUNNER_IMAGE: golang:1.26.10-bookworm
+      HOME: /tmp/runner-home
+      DOCKER_CONFIG: /tmp/runner-home/.docker
+      # e2-medium cold Go compilation can exceed the application's 10 s
+      # default, so the temporary demo uses the existing configurable limit.
+      EXECUTION_TIMEOUT: 20s
+      EXECUTION_MAX_SOURCE_BYTES: 131072
+      EXECUTION_MAX_OUTPUT_BYTES: 65536
+      EXECUTION_MEMORY_BYTES: 536870912
+      EXECUTION_CPUS: "1"
+      EXECUTION_PIDS: 64
+      EXECUTION_WORKSPACE_BYTES: 16777216
+      EXECUTION_TEMPORARY_BYTES: 268435456
+    volumes:
+      - runner-socket:/run/collab
+      - /var/run/docker.sock:/var/run/docker.sock
+    network_mode: none
+    depends_on:
+      runner-volume-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD-SHELL", "test -S /run/collab/runner.sock"]
+      interval: 5s
+      timeout: 2s
+      retries: 20
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,noexec,size=16m,uid=10001,gid=10001
+
+  backend:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    environment:
+      APP_ENV: production
+      PORT: 8080
+      REST_TLS_CERT_FILE: /run/collab-certs/server.crt
+      REST_TLS_KEY_FILE: /run/collab-certs/server.key
+      STORAGE_DRIVER: mysql
+      MYSQL_DSN: ${MYSQL_USER:-collab}:${MYSQL_PASSWORD:?set MYSQL_PASSWORD}@tcp(mysql:3306)/${MYSQL_DATABASE:-collab_editor}?charset=utf8mb4&parseTime=true&loc=UTC
+      MYSQL_MAX_OPEN_CONNS: 12
+      MYSQL_MAX_IDLE_CONNS: 6
+      MYSQL_CONN_MAX_LIFETIME: 5m
+      MYSQL_PING_TIMEOUT: 5s
+      MYSQL_QUERY_TIMEOUT: 5s
+      AUTH_MODE: jwt
+      JWT_SECRET: ${JWT_SECRET:?set JWT_SECRET}
+      JWT_ISSUER: collab-editor-demo
+      JWT_AUDIENCE: collab-editor-demo-api
+      JWT_TTL: 15m
+      REFRESH_TOKEN_TTL: 24h
+      REFRESH_REPLAY_TTL: 10m
+      REFRESH_REPLAY_ENCRYPTION_KEY: ${REFRESH_REPLAY_ENCRYPTION_KEY:?set REFRESH_REPLAY_ENCRYPTION_KEY}
+      REDIS_ADDR: redis:6379
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?set REDIS_PASSWORD}
+      REDIS_DB: 0
+      CORS_ALLOWED_ORIGINS: ${PUBLIC_ORIGIN:?set PUBLIC_ORIGIN}
+      QUIC_ADDR: :8443
+      QUIC_TLS_CERT_FILE: /run/collab-certs/server.crt
+      QUIC_TLS_KEY_FILE: /run/collab-certs/server.key
+      QUIC_CA_FILE: /run/collab-certs/ca.crt
+      RUNNER_SOCKET: /run/collab/runner.sock
+      RUNNER_TOKEN: ${RUNNER_TOKEN:?set RUNNER_TOKEN}
+      RUNNER_IMAGE: golang:1.26.10-bookworm
+      EXECUTION_TIMEOUT: 20s
+      EXECUTION_GLOBAL_CONCURRENCY: 2
+      EXECUTION_USER_CONCURRENCY: 1
+      EXECUTION_RATE_LIMIT: 6
+      ADMIN_ADDR: 127.0.0.1:9090
+      CLUSTER_MODE: single
+      OTEL_EXPORTER_OTLP_ENDPOINT: ""
+      OTEL_EXPORTER_OTLP_INSECURE: "false"
+    volumes:
+      - runner-socket:/run/collab
+      - ${DEMO_CERT_DIR:?set DEMO_CERT_DIR}:/run/collab-certs:ro
+    networks:
+      - edge
+      - data
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      runner:
+        condition: service_healthy
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    read_only: true
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,noexec,size=32m
+
+  nginx:
+    build:
+      context: ../..
+      dockerfile: deploy/demo/Dockerfile.frontend
+    restart: unless-stopped
+    volumes:
+      - ${DEMO_CERT_DIR:?set DEMO_CERT_DIR}/ca.crt:/etc/nginx/certs/ca.crt:ro
+    networks:
+      - edge
+    depends_on:
+      backend:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1/demo-healthz | grep -qx ok"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - DAC_OVERRIDE
+      - SETGID
+      - SETUID
+      - NET_BIND_SERVICE
+
+  cloudflared:
+    image: cloudflare/cloudflared:2026.10.7
+    restart: unless-stopped
+    command: ["tunnel", "--no-autoupdate", "--url", "http://nginx:80"]
+    networks:
+      - edge
+    depends_on:
+      nginx:
+        condition: service_healthy
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    read_only: true
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,noexec,size=16m
+
+volumes:
+  mysql-data:
+  redis-data:
+  runner-socket:
+
+networks:
+  edge:
+  data:
+    internal: true

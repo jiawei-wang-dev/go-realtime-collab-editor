@@ -19,6 +19,10 @@ certs
 __MACOSX
 bin
 dist
+frontend/node_modules
+frontend/dist
+frontend/playwright-report
+frontend/test-results
 coverage.out
 .terraform
 **/.terraform

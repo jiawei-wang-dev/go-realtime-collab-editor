@@ -26,7 +26,9 @@ import (
 	"github.com/jiawei-wang-dev/go-realtime-collab-editor/internal/observability"
 	"github.com/jiawei-wang-dev/go-realtime-collab-editor/internal/storage"
 	mysqlstorage "github.com/jiawei-wang-dev/go-realtime-collab-editor/internal/storage/mysql"
+	browsertransport "github.com/jiawei-wang-dev/go-realtime-collab-editor/internal/transport/browser"
 	quictransport "github.com/jiawei-wang-dev/go-realtime-collab-editor/internal/transport/quic"
+	webtransporttransport "github.com/jiawei-wang-dev/go-realtime-collab-editor/internal/transport/webtransport"
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 )
 
@@ -114,20 +116,24 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	webTransportServer, err := listenWebTransport(runtimeConfig, application, authenticator, authService, ownership, directory)
+	if err != nil {
+		return errors.Join(err, quicServer.Close(context.Background()), shutdownUnstarted(listener, application))
+	}
 	publicHandler := otelhttp.NewHandler(metrics.InstrumentHTTP("public", application), "http.public")
 	httpServer := newHTTPServer(address, publicHandler)
 	internalHandler := otelhttp.NewHandler(metrics.InstrumentHTTP("internal", application.InternalHandler()), "http.internal")
 	internalListener, internalServer, err := listenInternalRPC(runtimeConfig, internalHandler, rpcCredentials)
 	if err != nil {
-		return errors.Join(err, quicServer.Close(context.Background()), shutdownUnstarted(listener, application))
+		return errors.Join(err, closeLifecycle(webTransportServer), quicServer.Close(context.Background()), shutdownUnstarted(listener, application))
 	}
 	adminListener, adminServer, err := listenAdmin(runtimeConfig.Observability.AdminAddress, health.Handler(metrics.Handler()))
 	if err != nil {
-		return errors.Join(err, closeListener(internalListener), quicServer.Close(context.Background()), shutdownUnstarted(listener, application))
+		return errors.Join(err, closeListener(internalListener), closeLifecycle(webTransportServer), quicServer.Close(context.Background()), shutdownUnstarted(listener, application))
 	}
 	if registry != nil {
 		if err := registry.MarkReady(ctx); err != nil {
-			return errors.Join(err, closeListener(adminListener), closeListener(internalListener), shutdownUnstarted(listener, application), quicServer.Close(context.Background()))
+			return errors.Join(err, closeListener(adminListener), closeListener(internalListener), shutdownUnstarted(listener, application), closeLifecycle(webTransportServer), quicServer.Close(context.Background()))
 		}
 		go observeMembership(ctx, registry.Membership(), metrics)
 	}
@@ -139,11 +145,16 @@ func run() error {
 	if runtimeConfig.REST.TLSEnabled() {
 		restScheme = "https"
 	}
-	slog.Info("service ready", "component", "server", "event", "node_ready", "rest_scheme", restScheme, "rest_address", address, "quic_address", quicServer.Addr().String())
+	webTransportAddress := "disabled"
+	if webTransportServer != nil {
+		webTransportAddress = webTransportServer.Addr().String()
+	}
+	slog.Info("service ready", "component", "server", "event", "node_ready", "rest_scheme", restScheme, "rest_address", address, "quic_address", quicServer.Addr().String(), "webtransport_address", webTransportAddress)
 	return serveWithRegistry(ctx, serviceGroup{
 		publicListener:   listener,
 		publicServer:     httpServer,
 		quicServer:       quicServer,
+		webTransport:     webTransportServer,
 		application:      application,
 		internalListener: internalListener,
 		internalServer:   internalServer,
@@ -152,6 +163,13 @@ func run() error {
 		health:           health,
 		metrics:          metrics,
 	}, registry)
+}
+
+func closeLifecycle(server quicLifecycle) error {
+	if server == nil {
+		return nil
+	}
+	return server.Close(context.Background())
 }
 
 func openInternalRPC(runtimeConfig config.Config, registry *clusteretcd.Registry) (cluster.NodeDirectory, cluster.PermissionForwarder, *clusterrpc.Credentials, error) {
@@ -422,6 +440,40 @@ func listenQUIC(runtimeConfig config.Config, application *api.Server, authentica
 	return quictransport.Listen(quicConfig, application.RoomManager(), authenticator)
 }
 
+func listenWebTransport(runtimeConfig config.Config, application *api.Server, authenticator authentication.Authenticator, authService *authentication.Service, ownership cluster.OwnerResolver, directory cluster.NodeDirectory) (*webtransporttransport.Server, error) {
+	if !runtimeConfig.WebTransport.Enabled {
+		return nil, nil
+	}
+	tlsConfig, err := loadRESTTLSConfig(config.RESTConfig{
+		TLSCertFile: runtimeConfig.WebTransport.TLSCertFile,
+		TLSKeyFile:  runtimeConfig.WebTransport.TLSKeyFile,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("load WebTransport TLS configuration: %w", err)
+	}
+	tlsConfig.MinVersion = tls.VersionTLS13
+	registry := (*authentication.ConnectionRegistry)(nil)
+	if authService != nil {
+		registry = authService.Registry()
+	}
+	return webtransporttransport.Listen(webtransporttransport.Config{
+		Address: runtimeConfig.WebTransport.Address, TLSConfig: tlsConfig,
+		AllowedOrigins: runtimeConfig.Security.AllowedOrigins,
+		StreamTimeout:  runtimeConfig.WebTransport.StreamTimeout, IdleTimeout: runtimeConfig.WebTransport.IdleTimeout,
+		MaxMessageSize: uint32(runtimeConfig.WebTransport.MaxMessageSize),
+		Session:        browsertransportConfig(runtimeConfig, application, authenticator, registry, ownership, directory),
+	})
+}
+
+func browsertransportConfig(runtimeConfig config.Config, application *api.Server, authenticator authentication.Authenticator, registry *authentication.ConnectionRegistry, ownership cluster.OwnerResolver, directory cluster.NodeDirectory) browsertransport.Config {
+	return browsertransport.Config{
+		Manager: application.RoomManager(), Authenticator: authenticator, ConnectionRegistry: registry,
+		AuthTimeout: runtimeConfig.WebTransport.AuthTimeout, OperationTimeout: runtimeConfig.WebTransport.OperationTimeout,
+		WriteTimeout: runtimeConfig.WebTransport.WriteTimeout, SendQueueSize: runtimeConfig.WebTransport.SendQueueSize,
+		OwnerResolver: ownership, LocalNode: runtimeConfig.Cluster.Node, NodeDirectory: directory,
+	}
+}
+
 func observeRuntime(ctx context.Context, application *api.Server, store storage.Store, metrics *observability.Metrics) {
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
@@ -558,6 +610,7 @@ type serviceGroup struct {
 	publicListener   net.Listener
 	publicServer     *http.Server
 	quicServer       quicLifecycle
+	webTransport     quicLifecycle
 	application      *api.Server
 	internalListener net.Listener
 	internalServer   *http.Server
@@ -577,13 +630,18 @@ func serve(ctx context.Context, listener net.Listener, server *http.Server, quic
 }
 
 func serveServices(ctx context.Context, services serviceGroup) error {
-	serveErrors := make(chan error, 4)
+	serveErrors := make(chan error, 5)
 	go func() {
 		serveErrors <- services.publicServer.Serve(services.publicListener)
 	}()
 	go func() {
 		serveErrors <- services.quicServer.Serve(ctx)
 	}()
+	if services.webTransport != nil {
+		go func() {
+			serveErrors <- services.webTransport.Serve(ctx)
+		}()
+	}
 	if services.internalServer != nil && services.internalListener != nil {
 		go func() {
 			serveErrors <- services.internalServer.Serve(services.internalListener)
@@ -613,6 +671,10 @@ func serveServices(ctx context.Context, services serviceGroup) error {
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 	defer cancel()
 	quicErr := services.quicServer.Close(shutdownCtx)
+	var webTransportErr error
+	if services.webTransport != nil {
+		webTransportErr = services.webTransport.Close(shutdownCtx)
+	}
 	var internalErr error
 	if services.internalServer != nil {
 		internalErr = services.internalServer.Shutdown(shutdownCtx)
@@ -632,7 +694,7 @@ func serveServices(ctx context.Context, services serviceGroup) error {
 	if errors.Is(adminErr, http.ErrServerClosed) {
 		adminErr = nil
 	}
-	return errors.Join(serveErr, quicErr, internalErr, adminErr, roomErr, httpErr)
+	return errors.Join(serveErr, quicErr, webTransportErr, internalErr, adminErr, roomErr, httpErr)
 }
 
 func serveWithRegistry(ctx context.Context, services serviceGroup, registry *clusteretcd.Registry) error {

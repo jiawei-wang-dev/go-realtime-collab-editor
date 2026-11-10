@@ -4,15 +4,17 @@
 
 A distributed real-time collaborative code editor with multi-node ownership, reliable synchronization, and isolated Go code execution.
 
-![Go](https://img.shields.io/badge/Go-1.26.10-00ADD8?logo=go&logoColor=white) ![React](https://img.shields.io/badge/React-19.3.1-61DAFB?logo=react&logoColor=111827) ![TypeScript](https://img.shields.io/badge/TypeScript-6.0.3-3178C6?logo=typescript&logoColor=white) ![Monaco Editor](https://img.shields.io/badge/Monaco_Editor-0.57.0-007ACC?logo=visualstudiocode&logoColor=white) ![QUIC](https://img.shields.io/badge/QUIC-TLS_1.3-6D7CFF) ![WebSocket](https://img.shields.io/badge/WebSocket-Browser_Gateway-4B5563) ![MySQL](https://img.shields.io/badge/MySQL-8.4.13-4479A1?logo=mysql&logoColor=white) ![Redis](https://img.shields.io/badge/Redis-7.4.5-DC382D?logo=redis&logoColor=white) ![etcd](https://img.shields.io/badge/etcd-3.5.17-419EDA?logo=etcd&logoColor=white) ![Docker](https://img.shields.io/badge/Docker-Isolated_Runner-2496ED?logo=docker&logoColor=white)
+![Go](https://img.shields.io/badge/Go-1.26.10-00ADD8?logo=go&logoColor=white) ![React](https://img.shields.io/badge/React-19.3.1-61DAFB?logo=react&logoColor=111827) ![TypeScript](https://img.shields.io/badge/TypeScript-6.0.3-3178C6?logo=typescript&logoColor=white) ![Monaco Editor](https://img.shields.io/badge/Monaco_Editor-0.57.0-007ACC?logo=visualstudiocode&logoColor=white) ![QUIC](https://img.shields.io/badge/QUIC-TLS_1.3-6D7CFF) ![WebTransport](https://img.shields.io/badge/WebTransport-HTTP%2F3-5B6CFF) ![WebSocket](https://img.shields.io/badge/WebSocket-Fallback-4B5563) ![MySQL](https://img.shields.io/badge/MySQL-8.4.13-4479A1?logo=mysql&logoColor=white) ![Redis](https://img.shields.io/badge/Redis-7.4.5-DC382D?logo=redis&logoColor=white) ![etcd](https://img.shields.io/badge/etcd-3.5.17-419EDA?logo=etcd&logoColor=white) ![Docker](https://img.shields.io/badge/Docker-Isolated_Runner-2496ED?logo=docker&logoColor=white)
 
 ## 1. Project Overview
 
-This project implements a real-time collaborative editor for code and plain text, with a React browser UI and a recoverable CLI client. Both clients use REST for account and document management. Native clients use reliable ordered QUIC streams, while browsers use a same-process WebSocket gateway that feeds the same Room, OT, permission, ownership, and persistence path. The server resolves concurrent Insert/Delete operations with Operational Transformation (OT), keeps each document's in-memory state inside one Room goroutine, and persists documents, permissions, operation logs, snapshots, and fencing tokens through MySQL transactions.
+This project implements a real-time collaborative editor for code and plain text, with a React browser UI and a recoverable CLI client. Both clients use REST for account and document management. Native clients communicate over Native QUIC, browsers use WebTransport over HTTP/3, and WebSocket remains available as a browser compatibility fallback. Every real-time adapter feeds the same authenticated session and Room path. The server resolves concurrent Insert/Delete operations with Operational Transformation (OT), keeps each document's in-memory state inside one Room goroutine, and persists documents, permissions, operation logs, snapshots, and fencing tokens through MySQL transactions.
 
-QUIC provides TLS 1.3, reliable ordered streams, connection-level timeouts, and room for transport evolution over UDP, while keeping the real-time data plane separate from the REST control plane. The multi-node design removes the long-term availability dependency on a single process: etcd manages membership and lease-backed ownership, Rendezvous Hashing selects only the preferred candidate, and MySQL fencing tokens ultimately prevent stale owners from writing.
+**Low-latency real-time collaboration:** QUIC is the core real-time transport selected for the project's low-latency, multiplexing, and connection-recovery design goals. Browsers connect through WebTransport (HTTP/3 over QUIC), native Go clients use Native QUIC, and WebSocket provides a compatibility fallback. Together with OT, the Room event queue, remote cursor presence, and reconnect recovery, this transport layer supports multi-user collaborative editing.
 
-The main stack is Go, React, TypeScript, Monaco Editor, QUIC/WebSocket, MySQL, Redis, etcd, SQLite, JWT, mTLS, Prometheus, and OpenTelemetry. The backend, browser UI, CLI recovery path, multi-node failover, and real-dependency integration tests are implemented. Docker and Google Cloud Terraform assets are prepared, but no cloud deployment has been performed.
+The multi-node design removes the long-term availability dependency on a single process: etcd manages membership and lease-backed ownership, Rendezvous Hashing selects only the preferred candidate, and MySQL fencing tokens ultimately prevent stale owners from writing. Snapshot + Replay restores durable document state after ownership changes, while Redis coordinates sessions, operation leases, presence, and cross-node revocation.
+
+The main stack is Go, React, TypeScript, Monaco Editor, native QUIC, WebTransport/WebSocket, MySQL, Redis, etcd, SQLite, JWT, mTLS, Prometheus, and OpenTelemetry. The backend, browser UI, CLI recovery path, multi-node failover, and real-dependency integration tests are implemented. Docker and Google Cloud Terraform assets are prepared, but cloud deployment is paused and no cloud resources have been created.
 
 ## Screenshots
 
@@ -38,7 +40,7 @@ The sign-in screen presents the product's visual identity while keeping the pass
 
 | Feature | Implementation |
 | --- | --- |
-| Real-time Communication | QUIC for native clients; WebSocket gateway for browsers; one shared protocol and Room path |
+| Real-time Communication | Native QUIC for CLI clients; WebTransport preferred and WebSocket fallback for browsers; one shared protocol and Room path |
 | Browser Editor | React, TypeScript, Monaco Editor, Zustand, IndexedDB pending recovery |
 | Go Code Execution | Live Monaco source executed by an authenticated, Docker-isolated Runner |
 | Collaborative Editing | Versioned Operational Transformation with Insert/Delete |
@@ -65,7 +67,8 @@ flowchart TB
     Browser[React + Monaco Browser Client]
     REST[REST API]
     QUIC[QUIC Transport<br/>UDP + TLS 1.3]
-    WS[WebSocket Gateway<br/>Browser Transport]
+    WT[WebTransport Adapter<br/>HTTP/3 + TLS 1.3]
+    WS[WebSocket Gateway<br/>Compatibility Fallback]
     ExecAPI[Execution API<br/>Auth + Permission + Limits]
     Keyring[OS Keyring]
     SQLite[(Client SQLite)]
@@ -74,7 +77,7 @@ flowchart TB
     Sandbox[Ephemeral Go Sandbox<br/>non-root + no network]
 
     subgraph Cluster[Application Nodes]
-        Nodes[Node A / Node B / Node C<br/>REST + QUIC]
+        Nodes[Node A / Node B / Node C<br/>REST + Native QUIC + HTTP/3]
         RM[Per-node Room Manager]
         Room[Owned Document Room<br/>single goroutine]
         OT[Versioned OT]
@@ -87,18 +90,21 @@ flowchart TB
     Client --> REST
     Client --> QUIC
     Browser --> REST
-    Browser --> WS
+    Browser -->|Preferred| WT
+    Browser -.->|Fallback when API unavailable| WS
     Browser -->|Run current Monaco buffer| ExecAPI
     Client --> SQLite
     Client --> Keyring
     REST --> Nodes
     QUIC --> Nodes
+    WT --> Nodes
     WS --> Nodes
     Nodes --> RM
     RM --> Room
     Room --> OT
-    Browser -. Cursor / Selection .-> WS
-    WS -. Ephemeral Room broadcast .-> Room
+    Browser -. Cursor / Selection .-> WT
+    WT -. Ephemeral Room broadcast .-> Room
+    WS -. Same shared session .-> Room
     Nodes <--> Etcd
     Room --> MySQL
     Nodes --> Redis
@@ -107,7 +113,7 @@ flowchart TB
     Runner --> Sandbox
 ```
 
-The REST API is the control plane for authentication, documents, and permissions. QUIC remains the native real-time data plane, while the browser WebSocket gateway adapts JSON frames to the same transport-neutral Room API; it does not duplicate collaboration logic. A client may connect to any node, which either serves the document or returns an owner redirect based on trusted etcd membership. When an owner-sensitive permission write reaches a non-owner node, the node forwards it over internal mTLS so the owner can reauthenticate and execute it.
+The REST API is the control plane for authentication, documents, and permissions. The custom QUIC listener remains the native real-time data plane. Browsers prefer a separate HTTP/3 WebTransport listener and use WebSocket only as a compatibility fallback. Both browser adapters terminate at one shared session core for JWT/session validation, Owner Redirect, Room access, Resume/Sync, Cursor and revocation; no collaboration logic is duplicated. A client may connect to any node, which either serves the document or returns an owner redirect based on trusted etcd membership. When an owner-sensitive permission write reaches a non-owner node, the node forwards it over internal mTLS so the owner can reauthenticate and execute it.
 
 Each application node has its own Room Manager, which creates, recovers, and retires Rooms owned by that node. A Room depends only on transport and storage interfaces, not directly on QUIC or SQL. MySQL is authoritative for documents and final write validation, etcd is authoritative for live nodes and ownership, and Redis is limited to sessions, operation leases, presence, and cross-node revocation. The client stores document versions and pending edits in SQLite, while refresh tokens remain in the OS keyring.
 
@@ -205,7 +211,7 @@ Versions below are read from the current repository configuration.
 | Browser UI | React / TypeScript / Vite | `19.3.1` / `6.0.3` / `8.3.6` |
 | Browser Editor | Monaco Editor / Zustand | `0.57.0` / `5.1.0` |
 | HTTP | Go `net/http` | standard library |
-| Realtime Transport | `quic-go` / `coder/websocket` | `v0.49.1` / `v1.8.15`; TLS 1.3 for QUIC |
+| Realtime Transport | `quic-go` / `webtransport-go` / `coder/websocket` | `v0.62.0` / `v0.13.0` / `v1.8.15`; TLS 1.3 for QUIC/HTTP3 |
 | Database | MySQL | local `8.4.13`; Cloud SQL target `MYSQL_8_4` |
 | Session / Presence | Redis | local `7.4.5`; Memorystore target `REDIS_7_2` |
 | Coordination | etcd | `3.5.17` |
@@ -221,7 +227,7 @@ Versions below are read from the current repository configuration.
 
 ```text
 cmd/                    # Executables
-  server/               # REST, QUIC, and lifecycle composition root
+  server/               # REST, native QUIC, WebTransport, and lifecycle composition root
   quic-client/          # Recoverable CLI client
   migrate/              # MySQL migration runner
   admin/                # Administrative utility
@@ -245,8 +251,10 @@ internal/
   storage/              # Storage contracts, memory implementation, and replay
     mysql/               # MySQL transactions and fencing implementation
   transport/            # Transport interface
+    browser/             # Shared browser authentication, routing, recovery, and Room session
     quic/                # QUIC framing, client, server, and connection lifecycle
-  websocket/            # Browser adapter over the same Room Manager
+    webtransport/        # HTTP/3 WebTransport listener and reliable stream framing
+  websocket/            # WebSocket adapter over the shared browser session
 frontend/               # React + TypeScript + Vite + Monaco browser client
 migrations/             # MySQL schema migrations
 deploy/gcp/              # Google Cloud Terraform and startup templates
@@ -297,7 +305,7 @@ go run ./cmd/migrate
 
 ### Server Startup
 
-Single-node development mode still exercises MySQL, Redis, JWT, and QUIC. REST listens on TCP `:8080`, QUIC on UDP `:8443`, and management endpoints on `127.0.0.1:9090` by default.
+Single-node development mode still exercises MySQL, Redis, JWT, and native QUIC. REST listens on TCP `:8080`, native QUIC on UDP `:8443`, and management endpoints on `127.0.0.1:9090` by default. WebTransport is opt-in and can share numeric port `8080` over UDP; it requires a browser-trusted TLS certificate and an exact `CORS_ALLOWED_ORIGINS` entry.
 
 ```bash
 go run ./cmd/server
@@ -305,7 +313,7 @@ go run ./cmd/server
 
 ### Start the Browser Client
 
-The Vite development server proxies REST and WebSocket traffic to `localhost:8080`. Refresh tokens remain in an HttpOnly, SameSite cookie; access tokens are held in memory.
+The Vite development server proxies REST and WebSocket traffic to `localhost:8080`. It cannot proxy HTTP/3/UDP: local WebTransport testing must set `WEBTRANSPORT_ENABLED=true`, configure TLS on the Go server, and set `VITE_WEBTRANSPORT_URLS=https://localhost:8080/api/webtransport`. With an explicit WebTransport endpoint, `VITE_REALTIME_TRANSPORT=auto` prefers WebTransport and falls back only when the browser API is unavailable; without one it preserves the WebSocket path. Local Chrome QUIC does not add locally installed CAs as trust anchors, so a short-lived development certificate may be pinned with `VITE_WEBTRANSPORT_CERT_SHA256`; production should use public PKI and omit the pin. Use `webtransport` or `websocket` to force a path. Refresh tokens remain in an HttpOnly, SameSite cookie; access tokens are held in memory.
 
 ```bash
 cd frontend
@@ -391,17 +399,9 @@ go build ./...
 - Integration tests explicitly skip when their environment variables are absent; a skipped result is not treated as real-infrastructure validation. Required values include `MYSQL_TEST_DSN`, `REDIS_TEST_ADDR`, `REDIS_TEST_PASSWORD`, `ETCD_TEST_ENDPOINTS`, etcd TLS files, and the `CLUSTER_TEST_*` internal mTLS certificates.
 - The isolated, no-skip validation procedure and results are documented in [Final Quality Gate](docs/operations/final-quality-gate.md) and [Phase 9.1 Audit](docs/operations/phase-9.1-pre-commit-audit.md).
 
-### Controlled Multi-node Results
+### Controlled Multi-node Validation
 
-These results come from a small controlled burst test on an Apple M4 development machine. They are not production capacity, SLA, or soak-test claims.
-
-| Nodes | Clients | Documents | Applied Edits | Errors | RPS | P95 |
-| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 1 | 4 | 2 | 40 | 0 | 241.3 | 24.6 ms |
-| 3 | 9 | 6 | 135 | 0 | 491.5 | 29.9 ms |
-| 5 | 15 | 10 | 300 | 0 | 660.0 | 29.8 ms |
-
-See [Phase 8.9 Load Test](docs/performance/phase-8.9-load-test.md) for conditions, fault injection, and limitations.
+A controlled development-machine run exercised 1-, 3-, and 5-node topologies, up to 15 concurrent clients and 300 applied edits, with no edit errors in the recorded run. This is functional and engineering validation rather than a production capacity or SLA claim. The complete environment and raw results remain in the [Phase 8.9 Load Test](docs/performance/phase-8.9-load-test.md).
 
 ## 9. Deployment
 
@@ -425,6 +425,9 @@ Do not apply without an approved plan, budget, and rollback procedure.
 | Document | Description |
 | --- | --- |
 | [Final Code Review](docs/architecture/final-code-review.md) | Phase 1–9.0 architecture boundaries, call paths, and review findings |
+| [Phase 11 Transport Audit](docs/architecture/phase-11.0-transport-audit.md) | Native QUIC, WebTransport, WebSocket, shared-session boundaries, security, and compatibility |
+| [Browser WebTransport Implementation](docs/architecture/phase-11.0-webtransport-implementation.md) | HTTP/3 listener, shared browser session, framing, authentication, redirect, and recovery implementation |
+| [Distributed WebTransport Recovery](docs/architecture/phase-11.1-recovery-report.md) | Two-node browser redirect, owner termination, fencing, pending recovery, and safe owner restart |
 | [Frontend Architecture](docs/frontend/phase-10.1-frontend-architecture.md) | Browser transport, authentication, state, recovery, and integration design |
 | [Browser UI Report](docs/frontend/phase-10.2-ui-report.md) | Implemented pages, component boundaries, visual checks, and UI limitations |
 | [Frontend Integration](docs/frontend/phase-10.3-integration-report.md) | REST/WebSocket compatibility, recovery behavior, and Phase 10 test evidence |
@@ -432,6 +435,7 @@ Do not apply without an approved plan, budget, and rollback procedure.
 | [Cursor Design](docs/frontend/phase-10.5-cursor-design.md) | Cursor protocol, OT position transformation, lifecycle, and rate limits |
 | [Cursor Acceptance](docs/frontend/phase-10.5-acceptance-report.md) | Real browser and cross-node cursor validation |
 | [Browser Compatibility](docs/frontend/phase-10.6-browser-compatibility.md) | Chromium, Firefox, WebKit, and native Safari verification status |
+| [Browser Transport Compatibility](docs/frontend/phase-11.2-browser-transport-compatibility.md) | WebTransport selection, WebSocket fallback, and two-node browser behavior |
 | [Phase 10.7 Final Review](docs/architecture/phase-10.7-final-review.md) | Final backend, frontend, distributed-safety, and readability audit |
 | [Phase 10.7 Quality Gate](docs/operations/phase-10.7-final-quality-gate.md) | Final test, security, dependency, Docker, and Terraform validation |
 | [Go Execution Runner](docs/operations/go-execution-runner.md) | Phase 10.9 API, isolation boundary, resource limits, startup, and tests |
@@ -449,8 +453,7 @@ Do not apply without an approved plan, budget, and rollback procedure.
 - The browser editor synchronizes linear-text edits, cursors, selections, and online participants, but not rich-text metadata. Cursor presence is ephemeral and is rebuilt after Owner failover rather than persisted.
 - Browser execution supports one Go source file and the standard library only. It does not provide a shell, terminal, multi-file workspace, third-party module download, or other languages. Cold standard-library compilation counts toward the 10-second limit.
 - The local Runner uses the host Docker daemon, but the public API never receives Docker access. A production rollout requires a separately hardened Runner host/service and is not included in the current Google Cloud Terraform.
-- Chromium, Firefox, and Playwright WebKit are automated. Native Safari 26.5 is installed but remains unverified because Safari remote automation is disabled; WebKit is not reported as native Safari.
-- One QUIC connection currently carries one document over one bidirectional stream; datagrams and multi-document stream multiplexing are not enabled.
+- WebTransport requires a secure context, HTTP/3 UDP reachability, and a verified server identity. Automatic fallback is deliberately limited to browsers without the WebTransport API because browsers do not reliably distinguish TLS or Origin policy failures from ordinary connection failures; deployments can explicitly select WebSocket when compatibility requires it.
 - OT is a linear-text OT-lite implementation, not a full CRDT. Browser edits are stored in IndexedDB and replayed sequentially; complex client-side multi-operation rebasing remains limited.
 - The MySQL operation log is append-only and does not yet have a long-term archival policy.
 - The initial multi-node deployment assumes stable node identities; it does not automate scaling, certificate issuance, or proactive migration of healthy Rooms.

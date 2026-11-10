@@ -24,8 +24,8 @@ type DialConfig struct {
 }
 
 type Connection struct {
-	connection quic.Connection
-	stream     quic.Stream
+	connection *quic.Conn
+	stream     *quic.Stream
 	config     DialConfig
 	writeMu    sync.Mutex
 	closeOnce  sync.Once

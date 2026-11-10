@@ -5,6 +5,7 @@ import type { CursorState, RealtimeMessage } from '../types/protocol'
 import { createRequestId } from '../utils/requestId'
 import { applyOperation, diffOperations, transformOperation } from './operations'
 import { commitRecoveryState, loadPending, loadRecoveryState, savePending, type PendingEdit } from './pendingEdits'
+import { connectRealtimeTransport, realtimeSeedCount, websocketURL, type RealtimeTransport } from './realtimeTransport'
 
 const maxRedirects = 5
 const cursorThrottleMs = 50
@@ -15,43 +16,10 @@ export interface RealtimeSessionObserver {
   cursorRemoved?: (userID: string) => void
 }
 
-function isLoopback(hostname: string): boolean {
-  return hostname === 'localhost' || hostname === '127.0.0.1' || hostname === '[::1]'
-}
-
-function configuredGatewayURLs(): string[] {
-  const configured = (import.meta.env.VITE_REALTIME_URLS || import.meta.env.VITE_REALTIME_URL) as string | undefined
-  return configured?.split(',').map((value) => value.trim()).filter(Boolean) ?? []
-}
-
-function gatewayURL(endpoint?: string, seedIndex = 0): string {
-  if (endpoint) {
-    const url = new URL(endpoint, window.location.href)
-    if ((url.protocol !== 'http:' && url.protocol !== 'https:') || url.username || url.password) throw new Error('The owner returned an invalid endpoint.')
-    if (url.protocol === 'http:' && (window.location.protocol === 'https:' || !isLoopback(url.hostname))) throw new Error('The owner returned an insecure endpoint.')
-    url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:'
-    url.pathname = '/api/realtime'
-    url.search = ''
-    return url.toString()
-  }
-  const configured = configuredGatewayURLs()
-  if (configured.length > 0) {
-    const candidate = new URL(configured[seedIndex % configured.length])
-    if ((candidate.protocol !== 'ws:' && candidate.protocol !== 'wss:') || candidate.username || candidate.password) {
-      throw new Error('The configured realtime endpoint is invalid.')
-    }
-    if (candidate.protocol === 'ws:' && (window.location.protocol === 'https:' || !isLoopback(candidate.hostname))) {
-      throw new Error('The configured realtime endpoint is insecure.')
-    }
-    return candidate.toString()
-  }
-  const url = new URL('/api/realtime', window.location.href)
-  url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:'
-  return url.toString()
-}
-
 export class RealtimeSession {
-  private socket: WebSocket | null = null
+  private transport: RealtimeTransport | null = null
+
+  private connectionGeneration = 0
   private stopped = false
   private reconnectAttempt = 0
   private redirectCount = 0
@@ -64,7 +32,6 @@ export class RealtimeSession {
   private confirmedVersion = 0
   private hasJoined = false
   private authRefreshAttempted = false
-  private followingRedirect = false
   private tasks: Promise<void> = Promise.resolve()
   private reconnectTimer: number | null = null
   private cursorTimer: number | null = null
@@ -96,7 +63,7 @@ export class RealtimeSession {
     state.setDocument(this.withPending(this.confirmedContent), this.confirmedVersion)
     this.updatePendingCount()
     this.cursorHeartbeat = window.setInterval(() => this.sendCurrentCursor(true), cursorHeartbeatMs)
-    this.connect(false)
+    void this.connect(false)
   }
 
   stop(): void {
@@ -111,22 +78,23 @@ export class RealtimeSession {
     if (this.cursorHeartbeat !== null) window.clearInterval(this.cursorHeartbeat)
     this.cursorTimer = null
     this.cursorHeartbeat = null
-    this.socket?.close(1000, 'editor closed')
-    this.socket = null
+    this.connectionGeneration += 1
+    this.transport?.close('editor closed')
+    this.transport = null
   }
 
   private readonly handleOffline = (): void => {
     if (this.stopped) return
     useCollaborationStore.getState().setConnection('RECONNECTING')
-    const socket = this.socket
-    this.socket = null
+    const transport = this.transport
+    this.transport = null
     this.inFlight = ''
-    socket?.close()
+    transport?.close('browser offline')
   }
 
   private readonly handleOnline = (): void => {
-    if (this.stopped || this.socket !== null || this.reconnectTimer !== null) return
-    this.connect(true)
+    if (this.stopped || this.transport !== null || this.reconnectTimer !== null) return
+    void this.connect(true)
   }
 
   async updateContent(next: string): Promise<void> {
@@ -172,59 +140,67 @@ export class RealtimeSession {
     this.sendNext()
   }
 
-  private connect(reconnecting: boolean): void {
+  private async connect(reconnecting: boolean): Promise<void> {
     if (this.stopped) return
     useCollaborationStore.getState().setConnection(reconnecting ? 'RECONNECTING' : 'CONNECTING')
-    let target: string
+    const generation = ++this.connectionGeneration
     try {
-      target = gatewayURL(this.endpoint || undefined, this.seedIndex)
-    } catch (error) {
-      useCollaborationStore.getState().setError(error instanceof Error ? error.message : 'The owner returned an invalid endpoint.')
-      this.stop()
-      return
-    }
-    const socket = new WebSocket(target)
-    this.socket = socket
-    socket.onopen = () => {
-      this.reconnectAttempt = 0
-      useCollaborationStore.getState().setConnection('AUTHENTICATING')
-      socket.send(JSON.stringify({ type: 'auth', token: getAccessToken() }))
-    }
-    socket.onmessage = (event) => {
-      let message: RealtimeMessage
-      try {
-        message = JSON.parse(String(event.data)) as RealtimeMessage
-      } catch {
-        useCollaborationStore.getState().setError('The realtime server returned an invalid message.')
-        socket.close(1002, 'invalid server message')
+      const transport = await connectRealtimeTransport(this.endpoint || undefined, this.seedIndex, {
+        message: (message) => this.handleMessage(message, generation),
+        close: () => this.handleTransportClose(generation),
+      })
+      if (this.stopped || generation !== this.connectionGeneration) {
+        transport.close('superseded connection')
         return
       }
-      this.tasks = this.tasks
-        .catch(() => undefined)
-        .then(() => this.receive(message))
-        .catch((error: unknown) => {
-          useCollaborationStore.getState().setError(error instanceof Error ? error.message : 'Realtime recovery failed.')
-          socket.close(1011, 'recovery failed')
-        })
-    }
-    socket.onerror = () => socket.close()
-    socket.onclose = () => {
-      if (this.socket !== socket) return
-      this.socket = null
-      this.inFlight = ''
-      if (this.followingRedirect) {
-        this.followingRedirect = false
-      } else if (this.endpoint !== '') {
-        // Re-enter through the configured seed after an owner connection fails
-        // so the cluster can resolve a replacement owner.
+      this.transport = transport
+      useCollaborationStore.getState().setTransport(transport.kind)
+      this.reconnectAttempt = 0
+      useCollaborationStore.getState().setConnection('AUTHENTICATING')
+      transport.send({ type: 'auth', token: getAccessToken() })
+    } catch (error) {
+      if (this.stopped || generation !== this.connectionGeneration) return
+      if (error instanceof Error && (error.message.includes('invalid endpoint') || error.message.includes('insecure endpoint'))) {
+        useCollaborationStore.getState().setError(error.message)
+        this.stop()
+        return
+      }
+      if (this.endpoint !== '') {
         this.endpoint = ''
         this.redirectCount = 0
         this.visitedEndpoints.clear()
-      } else {
-        this.advanceSeed()
-      }
-      if (!this.stopped) this.scheduleReconnect()
+      } else this.advanceSeed()
+      this.scheduleReconnect()
     }
+  }
+
+  private handleMessage(message: RealtimeMessage, generation: number): void {
+    if (generation !== this.connectionGeneration) return
+    this.tasks = this.tasks.catch(() => undefined).then(() => this.receive(message)).catch((error: unknown) => {
+      useCollaborationStore.getState().setError(error instanceof Error ? error.message : 'Realtime recovery failed.')
+      this.disconnectAndReconnect('recovery failed')
+    })
+  }
+
+  private handleTransportClose(generation: number): void {
+    if (generation !== this.connectionGeneration) return
+    this.transport = null
+    this.inFlight = ''
+    if (this.endpoint !== '') {
+      this.endpoint = ''
+      this.redirectCount = 0
+      this.visitedEndpoints.clear()
+    } else this.advanceSeed()
+    if (!this.stopped) this.scheduleReconnect()
+  }
+
+  private disconnectAndReconnect(reason: string): void {
+    const transport = this.transport
+    this.transport = null
+    this.inFlight = ''
+    this.connectionGeneration += 1
+    transport?.close(reason)
+    if (!this.stopped) void this.connect(true)
   }
 
   private async receive(message: RealtimeMessage): Promise<void> {
@@ -288,7 +264,7 @@ export class RealtimeSession {
           return
         }
         try {
-          const redirected = gatewayURL(message.endpoint)
+          const redirected = websocketURL(message.endpoint)
           if (this.visitedEndpoints.has(redirected)) {
             state.setError('An owner redirect loop was detected.')
             this.stop()
@@ -302,15 +278,14 @@ export class RealtimeSession {
         }
         this.redirectCount += 1
         this.endpoint = message.endpoint
-        this.followingRedirect = true
-        this.socket?.close(1000, 'following owner redirect')
+        this.disconnectAndReconnect('following owner redirect')
         break
       case 'error':
         if (message.code === 'RESYNC_REQUIRED') { this.send({ type: 'resume', doc_id: this.documentId, last_version: 0 }); return }
         if (message.code === 'PERMISSION_DENIED' && !this.authRefreshAttempted) {
           this.authRefreshAttempted = true
           void useAuthStore.getState().refresh()
-            .then(() => this.socket?.close(1000, 'token refreshed'))
+            .then(() => this.disconnectAndReconnect('token refreshed'))
             .catch(() => {
               state.setError('Your session is no longer active.')
               this.stop()
@@ -409,7 +384,7 @@ export class RealtimeSession {
   }
 
   private send(message: RealtimeMessage): void {
-    if (this.socket?.readyState === WebSocket.OPEN) this.socket.send(JSON.stringify(message))
+    this.transport?.send(message)
   }
 
   private scheduleReconnect(): void {
@@ -419,7 +394,7 @@ export class RealtimeSession {
     this.reconnectAttempt += 1
     this.reconnectTimer = window.setTimeout(() => {
       this.reconnectTimer = null
-      this.connect(true)
+      void this.connect(true)
     }, delay)
   }
 
@@ -444,7 +419,7 @@ export class RealtimeSession {
   }
 
   private advanceSeed(): void {
-    const seeds = configuredGatewayURLs()
-    if (seeds.length > 1) this.seedIndex = (this.seedIndex + 1) % seeds.length
+    const seedCount = realtimeSeedCount()
+    if (seedCount > 1) this.seedIndex = (this.seedIndex + 1) % seedCount
   }
 }

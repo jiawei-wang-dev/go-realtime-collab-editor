@@ -1,0 +1,8 @@
+project_id = "your-free-trial-project-id"
+region     = "us-central1"
+zone       = "us-central1-a"
+
+# Reviewed fixed configuration. Changing either value invalidates the included
+# cost calculation and should be reviewed before apply.
+machine_type = "e2-medium"
+boot_disk_gb = 20

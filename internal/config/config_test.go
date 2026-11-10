@@ -58,6 +58,23 @@ func TestRESTTLSConfigurationMustBePaired(t *testing.T) {
 	}
 }
 
+func TestWebTransportRequiresTLSAndValidLimits(t *testing.T) {
+	t.Setenv("WEBTRANSPORT_ENABLED", "true")
+	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "WebTransport or REST TLS") {
+		t.Fatalf("WebTransport without TLS error = %v", err)
+	}
+	t.Setenv("WEBTRANSPORT_TLS_CERT_FILE", "webtransport.crt")
+	t.Setenv("WEBTRANSPORT_TLS_KEY_FILE", "webtransport.key")
+	// Loading now proceeds to the existing authentication checks.
+	if _, err := Load(); err == nil || strings.Contains(err.Error(), "WEBTRANSPORT") {
+		t.Fatalf("valid WebTransport configuration error = %v", err)
+	}
+	t.Setenv("WEBTRANSPORT_MAX_MESSAGE_SIZE", "0")
+	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "WEBTRANSPORT_MAX_MESSAGE_SIZE") {
+		t.Fatalf("invalid WebTransport message size error = %v", err)
+	}
+}
+
 func TestUnknownEnvironmentIsRejected(t *testing.T) {
 	t.Setenv("APP_ENV", "prodution")
 	if _, err := Load(); err == nil {

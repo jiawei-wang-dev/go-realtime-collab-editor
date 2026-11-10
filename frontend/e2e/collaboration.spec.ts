@@ -136,6 +136,9 @@ test('two real browser contexts collaborate, recover pending edits, refresh, and
     await pageA.getByPlaceholder('project/main.go').fill(documentId)
     await pageA.getByRole('button', { name: 'Create and open' }).click()
     await expect(pageA.locator('.connection-connected')).toBeVisible()
+    if (process.env.E2E_EXPECTED_TRANSPORT) {
+      await expect(pageA.locator('.editor-statusbar')).toContainText(process.env.E2E_EXPECTED_TRANSPORT)
+    }
     await replaceEditor(pageA, 'package main\n')
     await expect(pageA.locator('.editor-statusbar')).toContainText('0 pending')
 
@@ -204,6 +207,13 @@ test('two real browser contexts collaborate, recover pending edits, refresh, and
     const ownerUserId = await userId(accountPage)
     await accountPage.close()
 
+    // Monaco loads its icon font lazily. Finish loading static resources before
+    // the test intentionally removes network access so only recovery traffic is
+    // evaluated during the offline phase.
+    await pageA.evaluate(async () => {
+      await document.fonts.load('16px codicon')
+      await document.fonts.ready
+    })
     diagnosticsA.offline = true
     await contextA.setOffline(true)
     await expect(pageA.locator('.connection-reconnecting')).toBeVisible()

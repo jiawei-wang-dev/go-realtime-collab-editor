@@ -49,6 +49,8 @@ func TestGatewayUsesRoomProtocolAndSessionRegistry(t *testing.T) {
 	server := httptest.NewServer(gateway)
 	t.Cleanup(server.Close)
 
+	started := time.Now()
+	defer func() { t.Logf("PERF_SAMPLE_NS=%d", time.Since(started).Nanoseconds()) }()
 	connection, _, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(server.URL, "http"), nil)
 	if err != nil {
 		t.Fatal(err)

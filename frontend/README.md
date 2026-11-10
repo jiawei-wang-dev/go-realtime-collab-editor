@@ -1,6 +1,6 @@
 # Browser Client
 
-React, TypeScript, Monaco Editor, Zustand, and IndexedDB client for the collaborative editor. Browser realtime traffic uses the Go server's WebSocket gateway and therefore shares the existing Room, OT, permission, ownership, fencing, and persistence path with QUIC clients.
+React, TypeScript, Monaco Editor, Zustand, and IndexedDB client for the collaborative editor. Browser realtime traffic prefers WebTransport over HTTP/3 and uses WebSocket when the browser has no WebTransport API. Both adapters share the Go server's authentication, routing, Room, OT, permission, ownership, fencing, and persistence path with native QUIC clients.
 
 ## Run locally
 
@@ -23,7 +23,9 @@ described in [Go Execution Runner](../docs/operations/go-execution-runner.md).
 Optional production overrides:
 
 - `VITE_API_URL`: public REST origin.
-- `VITE_REALTIME_URL`: one complete `wss://.../api/realtime` seed URL.
+- `VITE_REALTIME_TRANSPORT`: `auto` (default), `webtransport`, or `websocket`.
+- `VITE_WEBTRANSPORT_URLS`: comma-separated `https://.../api/webtransport` seed URLs.
+- `VITE_REALTIME_URL`: one complete `wss://.../api/realtime` fallback seed URL.
 - `VITE_REALTIME_URLS`: comma-separated seed URLs. The client rotates seeds
   after a failed connection so a surviving node can resolve the new Owner.
 
@@ -31,7 +33,7 @@ In cluster mode, each node publishes `NODE_BROWSER_ENDPOINT` as its public
 HTTPS endpoint. This is intentionally separate from `NODE_HTTP_ENDPOINT`,
 which is reserved for internal mTLS RPC and is never exposed to browsers.
 
-The server must list the browser origin in `CORS_ALLOWED_ORIGINS`. Production requires HTTPS/WSS and a Secure refresh cookie.
+The server must list the browser origin in `CORS_ALLOWED_ORIGINS`. WebTransport requires HTTP/3/UDP reachability and a browser-trusted certificate; Vite's TCP proxy cannot proxy it. Production requires HTTPS/WSS and a Secure refresh cookie.
 
 ## Quality checks
 

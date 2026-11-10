@@ -44,6 +44,7 @@ type Config struct {
 	MaxHistoryOperations int
 	SnapshotTimeout      time.Duration
 	QUIC                 QUICConfig
+	WebTransport         WebTransportConfig
 	Cluster              ClusterConfig
 	Security             SecurityConfig
 	Execution            ExecutionConfig
@@ -127,6 +128,20 @@ type QUICConfig struct {
 	MaxConnections   int
 }
 
+type WebTransportConfig struct {
+	Enabled          bool
+	Address          string
+	TLSCertFile      string
+	TLSKeyFile       string
+	AuthTimeout      time.Duration
+	OperationTimeout time.Duration
+	WriteTimeout     time.Duration
+	StreamTimeout    time.Duration
+	IdleTimeout      time.Duration
+	MaxMessageSize   int
+	SendQueueSize    int
+}
+
 func Load() (Config, error) {
 	config := Config{
 		Port:          envOrDefault("PORT", "8080"),
@@ -135,6 +150,9 @@ func Load() (Config, error) {
 		AuthMode:      envOrDefault("AUTH_MODE", "jwt"),
 	}
 	if err := loadRESTConfig(&config); err != nil {
+		return Config{}, err
+	}
+	if err := loadWebTransportConfig(&config); err != nil {
 		return Config{}, err
 	}
 	if err := loadObservabilityConfig(&config); err != nil {
@@ -197,6 +215,53 @@ func Load() (Config, error) {
 	}
 	config.QUIC = quicConfig
 	return config, nil
+}
+
+func loadWebTransportConfig(config *Config) error {
+	enabled, err := strconv.ParseBool(envOrDefault("WEBTRANSPORT_ENABLED", "false"))
+	if err != nil {
+		return fmt.Errorf("WEBTRANSPORT_ENABLED must be a boolean")
+	}
+	wt := WebTransportConfig{
+		Enabled: enabled, Address: envOrDefault("WEBTRANSPORT_ADDR", ":8080"),
+		TLSCertFile: os.Getenv("WEBTRANSPORT_TLS_CERT_FILE"), TLSKeyFile: os.Getenv("WEBTRANSPORT_TLS_KEY_FILE"),
+	}
+	if !enabled {
+		config.WebTransport = wt
+		return nil
+	}
+	if wt.TLSCertFile == "" {
+		wt.TLSCertFile = config.REST.TLSCertFile
+	}
+	if wt.TLSKeyFile == "" {
+		wt.TLSKeyFile = config.REST.TLSKeyFile
+	}
+	if wt.TLSCertFile == "" || wt.TLSKeyFile == "" {
+		return fmt.Errorf("WEBTRANSPORT_ENABLED requires WebTransport or REST TLS certificate and key files")
+	}
+	if wt.AuthTimeout, err = duration("WEBTRANSPORT_AUTH_TIMEOUT", 10*time.Second); err != nil {
+		return err
+	}
+	if wt.OperationTimeout, err = duration("WEBTRANSPORT_OPERATION_TIMEOUT", 10*time.Second); err != nil {
+		return err
+	}
+	if wt.WriteTimeout, err = duration("WEBTRANSPORT_WRITE_TIMEOUT", 10*time.Second); err != nil {
+		return err
+	}
+	if wt.StreamTimeout, err = duration("WEBTRANSPORT_STREAM_TIMEOUT", 10*time.Second); err != nil {
+		return err
+	}
+	if wt.IdleTimeout, err = duration("WEBTRANSPORT_IDLE_TIMEOUT", 60*time.Second); err != nil {
+		return err
+	}
+	if wt.MaxMessageSize, err = positiveInt("WEBTRANSPORT_MAX_MESSAGE_SIZE", 1<<20); err != nil {
+		return err
+	}
+	if wt.SendQueueSize, err = positiveInt("WEBTRANSPORT_SEND_QUEUE_SIZE", 32); err != nil {
+		return err
+	}
+	config.WebTransport = wt
+	return nil
 }
 
 func loadObservabilityConfig(config *Config) error {

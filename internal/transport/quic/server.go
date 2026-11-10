@@ -142,6 +142,7 @@ func loadCAPool(caFile string) (*x509.CertPool, error) {
 
 type Server struct {
 	listener      *quic.Listener
+	packet        net.PacketConn
 	manager       *room.Manager
 	authenticator authentication.Authenticator
 	config        Config
@@ -164,7 +165,15 @@ func Listen(config Config, manager *room.Manager, authenticator authentication.A
 	tlsConfig := config.TLSConfig.Clone()
 	tlsConfig.MinVersion = tls.VersionTLS13
 	tlsConfig.NextProtos = []string{ALPN}
-	listener, err := quic.ListenAddr(config.Address, tlsConfig, &quic.Config{
+	udpAddress, err := net.ResolveUDPAddr("udp", config.Address)
+	if err != nil {
+		return nil, fmt.Errorf("resolve QUIC address: %w", err)
+	}
+	packet, err := net.ListenUDP("udp", udpAddress)
+	if err != nil {
+		return nil, fmt.Errorf("listen QUIC: %w", err)
+	}
+	listener, err := quic.Listen(packet, tlsConfig, &quic.Config{
 		HandshakeIdleTimeout:  config.HandshakeTimeout,
 		MaxIdleTimeout:        config.IdleTimeout,
 		KeepAlivePeriod:       config.KeepAlivePeriod,
@@ -173,10 +182,11 @@ func Listen(config Config, manager *room.Manager, authenticator authentication.A
 		EnableDatagrams:       false,
 	})
 	if err != nil {
+		_ = packet.Close()
 		return nil, fmt.Errorf("listen QUIC: %w", err)
 	}
 	return &Server{
-		listener: listener, manager: manager, authenticator: authenticator,
+		listener: listener, packet: packet, manager: manager, authenticator: authenticator,
 		config: config, clients: make(map[*Client]struct{}),
 	}, nil
 }
@@ -268,7 +278,7 @@ func (s *Server) releaseConnection() {
 	s.mu.Unlock()
 }
 
-func (s *Server) handleConnection(connection quic.Connection) {
+func (s *Server) handleConnection(connection *quic.Conn) {
 	_, span := otel.Tracer("collab-editor/quic").Start(connection.Context(), "quic.connection")
 	defer span.End()
 	stream, err := s.acceptCollaborationStream(connection)
@@ -287,13 +297,13 @@ func (s *Server) handleConnection(connection quic.Connection) {
 	s.runClient(connection, stream, targetRoom, initial, principal)
 }
 
-func (s *Server) acceptCollaborationStream(connection quic.Connection) (quic.Stream, error) {
+func (s *Server) acceptCollaborationStream(connection *quic.Conn) (*quic.Stream, error) {
 	ctx, cancel := context.WithTimeout(connection.Context(), s.config.AuthTimeout)
 	defer cancel()
 	return connection.AcceptStream(ctx)
 }
 
-func (s *Server) authenticateStream(connection quic.Connection, stream quic.Stream) (authentication.Principal, bool) {
+func (s *Server) authenticateStream(connection *quic.Conn, stream *quic.Stream) (authentication.Principal, bool) {
 	_ = stream.SetReadDeadline(time.Now().Add(s.config.AuthTimeout))
 	authMessage, err := readMessage(stream, s.config.MaxMessageSize)
 	if err != nil || authMessage.Type != protocol.TypeAuth || authMessage.Token == "" {
@@ -317,7 +327,7 @@ func (s *Server) authenticateStream(connection quic.Connection, stream quic.Stre
 	return principal, true
 }
 
-func (s *Server) selectDocument(connection quic.Connection, stream quic.Stream) (protocol.Message, *room.Room, bool) {
+func (s *Server) selectDocument(connection *quic.Conn, stream *quic.Stream) (protocol.Message, *room.Room, bool) {
 	_ = stream.SetReadDeadline(time.Now().Add(s.config.ReadTimeout))
 	initial, err := readMessage(stream, s.config.MaxMessageSize)
 	if err != nil || (initial.Type != protocol.TypeJoin && initial.Type != protocol.TypeResume) || initial.DocID == "" {
@@ -374,7 +384,7 @@ func (s *Server) isLocalOwner(owner cluster.Owner) bool {
 	return owner.NodeID == s.config.LocalNode.NodeID && owner.Incarnation == s.config.LocalNode.Incarnation
 }
 
-func (s *Server) runClient(connection quic.Connection, stream quic.Stream, targetRoom *room.Room, initial protocol.Message, principal authentication.Principal) {
+func (s *Server) runClient(connection *quic.Conn, stream *quic.Stream, targetRoom *room.Room, initial protocol.Message, principal authentication.Principal) {
 	client := newClient(connection, stream, targetRoom, initial.DocID, principal, s.authenticator, s.config)
 	if s.config.ConnectionRegistry != nil {
 		client.unregister = s.config.ConnectionRegistry.Register(principal.SessionID, client, func() {
@@ -392,7 +402,7 @@ func (s *Server) runClient(connection quic.Connection, stream quic.Stream, targe
 	client.run(initial)
 }
 
-func (s *Server) writeHandshakeError(stream quic.Stream, code, message string) {
+func (s *Server) writeHandshakeError(stream *quic.Stream, code, message string) {
 	_ = stream.SetWriteDeadline(time.Now().Add(s.config.WriteTimeout))
 	_ = writeMessage(stream, protocol.Error(code, message), s.config.MaxMessageSize)
 }
@@ -433,6 +443,7 @@ func (s *Server) Close(ctx context.Context) error {
 	if !s.closing {
 		s.closing = true
 		_ = s.listener.Close()
+		_ = s.packet.Close()
 	}
 	clients := make([]*Client, 0, len(s.clients))
 	for client := range s.clients {

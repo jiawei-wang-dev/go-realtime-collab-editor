@@ -4,15 +4,17 @@
 
 具备多节点 Ownership、可靠同步与隔离 Go 代码执行能力的分布式实时协作代码编辑器。
 
-![Go](https://img.shields.io/badge/Go-1.26.10-00ADD8?logo=go&logoColor=white) ![React](https://img.shields.io/badge/React-19.3.1-61DAFB?logo=react&logoColor=111827) ![TypeScript](https://img.shields.io/badge/TypeScript-6.0.3-3178C6?logo=typescript&logoColor=white) ![Monaco Editor](https://img.shields.io/badge/Monaco_Editor-0.57.0-007ACC?logo=visualstudiocode&logoColor=white) ![QUIC](https://img.shields.io/badge/QUIC-TLS_1.3-6D7CFF) ![WebSocket](https://img.shields.io/badge/WebSocket-Browser_Gateway-4B5563) ![MySQL](https://img.shields.io/badge/MySQL-8.4.13-4479A1?logo=mysql&logoColor=white) ![Redis](https://img.shields.io/badge/Redis-7.4.5-DC382D?logo=redis&logoColor=white) ![etcd](https://img.shields.io/badge/etcd-3.5.17-419EDA?logo=etcd&logoColor=white) ![Docker](https://img.shields.io/badge/Docker-Isolated_Runner-2496ED?logo=docker&logoColor=white)
+![Go](https://img.shields.io/badge/Go-1.26.10-00ADD8?logo=go&logoColor=white) ![React](https://img.shields.io/badge/React-19.3.1-61DAFB?logo=react&logoColor=111827) ![TypeScript](https://img.shields.io/badge/TypeScript-6.0.3-3178C6?logo=typescript&logoColor=white) ![Monaco Editor](https://img.shields.io/badge/Monaco_Editor-0.57.0-007ACC?logo=visualstudiocode&logoColor=white) ![QUIC](https://img.shields.io/badge/QUIC-TLS_1.3-6D7CFF) ![WebTransport](https://img.shields.io/badge/WebTransport-HTTP%2F3-5B6CFF) ![WebSocket](https://img.shields.io/badge/WebSocket-Fallback-4B5563) ![MySQL](https://img.shields.io/badge/MySQL-8.4.13-4479A1?logo=mysql&logoColor=white) ![Redis](https://img.shields.io/badge/Redis-7.4.5-DC382D?logo=redis&logoColor=white) ![etcd](https://img.shields.io/badge/etcd-3.5.17-419EDA?logo=etcd&logoColor=white) ![Docker](https://img.shields.io/badge/Docker-Isolated_Runner-2496ED?logo=docker&logoColor=white)
 
 ## 1. 项目介绍
 
-本项目实现了一个面向代码与纯文本场景的实时协作编辑器，包含 React 浏览器界面和可恢复的 CLI 客户端。两类客户端都通过 REST 管理账户与文档；原生客户端使用 QUIC 可靠有序 Stream，浏览器则通过同进程 WebSocket Gateway 进入同一套 Room、OT、权限、Ownership 和持久化流程。服务端使用 Operational Transformation（OT）处理并发 Insert/Delete，以单文档单 Room goroutine 串行维护内存状态，并在 MySQL 事务中持久化文档、权限、Operation Log、Snapshot 和 Fencing Token。
+本项目实现了一个面向代码与纯文本场景的实时协作编辑器，包含 React 浏览器界面和可恢复的 CLI 客户端。两类客户端都通过 REST 管理账户与文档；原生 Go 客户端使用 Native QUIC，浏览器使用基于 HTTP/3 的 WebTransport，并保留 WebSocket 作为浏览器兼容回退。所有实时传输 Adapter 共用同一套认证会话与 Room 流程。服务端使用 Operational Transformation（OT）处理并发 Insert/Delete，以单文档单 Room goroutine 串行维护内存状态，并在 MySQL 事务中持久化文档、权限、Operation Log、Snapshot 和 Fencing Token。
 
-选择 QUIC 是为了在 UDP 之上获得 TLS 1.3、可靠有序 Stream、连接级超时与后续扩展空间，同时让实时传输与 REST 控制面保持独立。多节点架构用于避免单节点成为长期可用性瓶颈：etcd 负责 Membership 和基于 Lease 的 Ownership，Rendezvous Hashing 只选择优先候选节点，MySQL Fencing Token 最终阻止旧 Owner 继续写入。
+**低延迟实时协作：** 项目采用 QUIC 作为核心实时通信协议，以满足低延迟传输、多路复用和连接恢复等设计目标。浏览器通过 WebTransport（HTTP/3 over QUIC）接入，原生 Go 客户端通过 Native QUIC 通信，并保留 WebSocket 兼容回退。结合 OT、Room 事件队列、远程光标和断线恢复机制，实现多人实时协作编辑。
 
-主要技术包括 Go、React、TypeScript、Monaco Editor、QUIC/WebSocket、MySQL、Redis、etcd、SQLite、JWT、mTLS、Prometheus 和 OpenTelemetry。当前后端、浏览器界面、CLI 恢复链路、多节点接管和真实依赖集成测试已经完成；Docker 与 Google Cloud Terraform 配置已经准备，但尚未执行云端部署。
+多节点架构用于避免单节点成为长期可用性瓶颈：etcd 负责 Membership 和基于 Lease 的 Ownership，Rendezvous Hashing 只选择优先候选节点，MySQL Fencing Token 最终阻止旧 Owner 继续写入。Ownership 变化后由 Snapshot + Replay 恢复持久化文档状态，Redis 则协调 Session、Operation Lease、Presence 与跨节点撤销。
+
+主要技术包括 Go、React、TypeScript、Monaco Editor、Native QUIC、WebTransport/WebSocket、MySQL、Redis、etcd、SQLite、JWT、mTLS、Prometheus 和 OpenTelemetry。当前后端、浏览器界面、CLI 恢复链路、多节点接管和真实依赖集成测试已经完成；Docker 与 Google Cloud Terraform 配置已经准备，但云端部署已暂停，尚未创建云资源。
 
 ## 项目截图
 
@@ -38,7 +40,7 @@
 
 | 功能 | 技术实现 |
 | --- | --- |
-| 实时通信 | 原生客户端使用 QUIC，浏览器使用 WebSocket Gateway，共用协议与 Room 流程 |
+| 实时通信 | CLI 使用 Native QUIC；浏览器优先 WebTransport、WebSocket 兼容回退；共用协议与 Room 流程 |
 | 浏览器编辑器 | React、TypeScript、Monaco Editor、Zustand、IndexedDB Pending 恢复 |
 | Go 代码运行 | 将 Monaco 当前文本交给经认证的 Docker 隔离 Runner 执行 |
 | 协作编辑 | Versioned Operational Transformation，支持 Insert/Delete |
@@ -65,7 +67,8 @@ flowchart TB
     Browser[React + Monaco 浏览器客户端]
     REST[REST API]
     QUIC[QUIC 实时传输<br/>UDP + TLS 1.3]
-    WS[WebSocket Gateway<br/>浏览器传输]
+    WT[WebTransport Adapter<br/>HTTP/3 + TLS 1.3]
+    WS[WebSocket Gateway<br/>兼容回退]
     ExecAPI[执行 API<br/>认证 + 权限 + 限制]
     Keyring[系统 Keyring]
     SQLite[(客户端 SQLite)]
@@ -74,7 +77,7 @@ flowchart TB
     Sandbox[临时 Go Sandbox<br/>非 Root + 无网络]
 
     subgraph Cluster[应用节点集群]
-        Nodes[Node A / Node B / Node C<br/>REST + QUIC]
+        Nodes[Node A / Node B / Node C<br/>REST + Native QUIC + HTTP/3]
         RM[每节点独立 Room Manager]
         Room[当前节点持有的文档 Room<br/>单 goroutine]
         OT[Versioned OT]
@@ -87,18 +90,21 @@ flowchart TB
     Client --> REST
     Client --> QUIC
     Browser --> REST
-    Browser --> WS
+    Browser -->|优先| WT
+    Browser -.->|API 不可用时回退| WS
     Browser -->|运行 Monaco 当前 Buffer| ExecAPI
     Client --> SQLite
     Client --> Keyring
     REST --> Nodes
     QUIC --> Nodes
+    WT --> Nodes
     WS --> Nodes
     Nodes --> RM
     RM --> Room
     Room --> OT
-    Browser -. 光标 / 选区 .-> WS
-    WS -. Room 临时广播 .-> Room
+    Browser -. 光标 / 选区 .-> WT
+    WT -. Room 临时广播 .-> Room
+    WS -. 共用同一会话核心 .-> Room
     Nodes <--> Etcd
     Room --> MySQL
     Nodes --> Redis
@@ -107,7 +113,7 @@ flowchart TB
     Runner --> Sandbox
 ```
 
-REST API 是认证、文档与权限管理的控制面。QUIC 仍是原生客户端的实时数据面；浏览器 WebSocket Gateway 只把 JSON Frame 适配到同一个 Transport-neutral Room API，不复制协作逻辑。客户端可以连接任意节点，节点根据可信 etcd Membership 中的 Owner 信息处理请求或返回 Owner Redirect。Owner-sensitive Permission 写入到达非 Owner 节点时，会通过内部 mTLS 转发到 Owner 节点重新鉴权并执行。
+REST API 是认证、文档与权限管理的控制面。自定义 QUIC Listener 仍是原生客户端的实时数据面；浏览器优先连接独立的 HTTP/3 WebTransport Listener，并仅把 WebSocket 作为兼容回退。两个浏览器 Adapter 都进入同一个共享会话核心，由它统一执行 JWT/Session 校验、Owner Redirect、Room 接入、Resume/Sync、Cursor 和撤销，不复制协作逻辑。客户端可以连接任意节点，节点根据可信 etcd Membership 中的 Owner 信息处理请求或返回 Owner Redirect。Owner-sensitive Permission 写入到达非 Owner 节点时，会通过内部 mTLS 转发到 Owner 节点重新鉴权并执行。
 
 每个应用节点拥有独立的 Room Manager，用于创建、恢复和回收本节点持有 Ownership 的文档 Room。Room 只依赖 Transport 与 Storage 接口，不直接依赖 QUIC 或 SQL。MySQL 是文档和最终写入校验的权威来源，etcd 是节点与在线 Ownership 的权威来源，Redis 只管理 Session、Operation Lease、Presence 和跨节点撤销通知。客户端将文档版本与 Pending Edit 保存在 SQLite，将 Refresh Token 保存在 OS Keyring。
 
@@ -205,7 +211,7 @@ Go 代码执行与协作数据链路完全分离：`Execution API → Runner →
 | 浏览器 UI | React / TypeScript / Vite | `19.3.1` / `6.0.3` / `8.3.6` |
 | 浏览器编辑器 | Monaco Editor / Zustand | `0.57.0` / `5.1.0` |
 | HTTP | Go `net/http` | 标准库 |
-| 实时传输 | `quic-go` / `coder/websocket` | `v0.49.1` / `v1.8.15`；QUIC 使用 TLS 1.3 |
+| 实时传输 | `quic-go` / `webtransport-go` / `coder/websocket` | `v0.62.0` / `v0.13.0` / `v1.8.15`；QUIC/HTTP3 使用 TLS 1.3 |
 | 数据库 | MySQL | 本地 `8.4.13`；Cloud SQL 目标 `MYSQL_8_4` |
 | Session / Presence | Redis | 本地 `7.4.5`；Memorystore 目标 `REDIS_7_2` |
 | 集群协调 | etcd | `3.5.17` |
@@ -221,7 +227,7 @@ Go 代码执行与协作数据链路完全分离：`Execution API → Runner →
 
 ```text
 cmd/                    # 可执行程序
-  server/               # REST、QUIC 与生命周期组合根
+  server/               # REST、Native QUIC、WebTransport 与生命周期组合根
   quic-client/          # 可恢复 CLI 客户端
   migrate/              # MySQL Migration runner
   admin/                # 管理工具
@@ -245,8 +251,10 @@ internal/
   storage/              # Storage 接口、Memory 实现与 Replay
     mysql/               # MySQL Transaction 与 Fencing 实现
   transport/            # Transport 接口
+    browser/             # 共用的浏览器认证、路由、恢复与 Room 会话
     quic/                # QUIC Framing、Client、Server、Connection 生命周期
-  websocket/            # 复用同一 Room Manager 的浏览器 Adapter
+    webtransport/        # HTTP/3 WebTransport Listener 与可靠 Stream Framing
+  websocket/            # 复用浏览器共享会话的 WebSocket Adapter
 frontend/               # React + TypeScript + Vite + Monaco 浏览器客户端
 migrations/             # MySQL Schema Migration
 deploy/gcp/              # Google Cloud Terraform 与启动模板
@@ -297,7 +305,7 @@ go run ./cmd/migrate
 
 ### 启动服务端
 
-单节点开发模式仍使用完整的 MySQL、Redis、JWT 和 QUIC 路径。REST 默认监听 TCP `:8080`，QUIC 默认监听 UDP `:8443`，管理端点默认只监听 `127.0.0.1:9090`。
+单节点开发模式仍使用完整的 MySQL、Redis、JWT 和 Native QUIC 路径。REST 默认监听 TCP `:8080`，Native QUIC 默认监听 UDP `:8443`，管理端点默认只监听 `127.0.0.1:9090`。WebTransport 为显式启用项，可以在 UDP 上复用数字端口 `8080`；它要求浏览器信任的 TLS 证书，以及精确匹配的 `CORS_ALLOWED_ORIGINS`。
 
 ```bash
 go run ./cmd/server
@@ -305,7 +313,7 @@ go run ./cmd/server
 
 ### 启动浏览器客户端
 
-Vite 开发服务器会把 REST 和 WebSocket 请求代理到 `localhost:8080`。Refresh Token 只保存在 HttpOnly、SameSite Cookie 中，Access Token 只保存在内存。
+Vite 开发服务器会把 REST 和 WebSocket 请求代理到 `localhost:8080`，但不能代理 HTTP/3/UDP。本地 WebTransport 测试需要设置 `WEBTRANSPORT_ENABLED=true`、为 Go 服务配置 TLS，并设置 `VITE_WEBTRANSPORT_URLS=https://localhost:8080/api/webtransport`。配置了显式 WebTransport Endpoint 后，`VITE_REALTIME_TRANSPORT=auto` 会优先选择 WebTransport，并且只在浏览器缺少该 API 时自动回退；未配置时继续使用 WebSocket。本地 Chrome QUIC 不会把本机安装的 CA 作为正向信任锚，因此短期开发证书可通过 `VITE_WEBTRANSPORT_CERT_SHA256` 进行标准指纹校验；生产环境应使用公开 PKI 并省略该指纹。也可使用 `webtransport` 或 `websocket` 强制指定。Refresh Token 只保存在 HttpOnly、SameSite Cookie 中，Access Token 只保存在内存。
 
 ```bash
 cd frontend
@@ -391,17 +399,9 @@ go build ./...
 - 未设置集成测试环境变量时，相关测试会明确 Skip；这种结果不能视为真实基础设施验证通过。变量包括 `MYSQL_TEST_DSN`、`REDIS_TEST_ADDR`、`REDIS_TEST_PASSWORD`、`ETCD_TEST_ENDPOINTS`、etcd TLS 文件，以及 `CLUSTER_TEST_*` 内部 mTLS 证书。
 - 完整隔离环境和无 Skip 的验收结果记录在 [最终质量 Gate](docs/operations/final-quality-gate.md) 与 [Phase 9.1 提交前审计](docs/operations/phase-9.1-pre-commit-audit.md)。
 
-### 受控多节点测试数据
+### 受控多节点验证
 
-以下结果来自 Apple M4 开发机上的小规模突发测试，不是生产容量、SLA 或长期稳定性声明。
-
-| 节点 | 客户端 | 文档 | 已应用 Edit | Error | RPS | P95 |
-| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 1 | 4 | 2 | 40 | 0 | 241.3 | 24.6 ms |
-| 3 | 9 | 6 | 135 | 0 | 491.5 | 29.9 ms |
-| 5 | 15 | 10 | 300 | 0 | 660.0 | 29.8 ms |
-
-详细条件、故障注入矩阵和限制见 [Phase 8.9 压力测试](docs/performance/phase-8.9-load-test.md)。
+一次受控开发机测试覆盖了 1、3、5 节点拓扑，最高包含 15 个并发客户端和 300 次已应用 Edit，记录中没有 Edit 错误。该结果用于功能与工程验证，不代表生产容量或 SLA；完整环境与原始结果保留在 [Phase 8.9 压力测试](docs/performance/phase-8.9-load-test.md)。
 
 ## 9. 部署
 
@@ -425,6 +425,9 @@ terraform -chdir=deploy/gcp plan -refresh=false
 | 文档 | 说明 |
 | --- | --- |
 | [最终代码审查](docs/architecture/final-code-review.md) | Phase 1–9.0 架构边界、调用链和审查结论 |
+| [Phase 11 Transport 审计](docs/architecture/phase-11.0-transport-audit.md) | Native QUIC、WebTransport、WebSocket、共享会话边界、安全性与兼容性 |
+| [浏览器 WebTransport 实现](docs/architecture/phase-11.0-webtransport-implementation.md) | HTTP/3 Listener、共享浏览器会话、Framing、认证、Redirect 与恢复实现 |
+| [分布式 WebTransport 恢复](docs/architecture/phase-11.1-recovery-report.md) | 双节点浏览器 Redirect、Owner 终止、Fencing、Pending 恢复与旧 Owner 安全重启 |
 | [前端架构](docs/frontend/phase-10.1-frontend-architecture.md) | 浏览器传输、认证、状态、恢复与集成设计 |
 | [浏览器 UI 报告](docs/frontend/phase-10.2-ui-report.md) | 已实现页面、组件边界、视觉检查与 UI 限制 |
 | [前后端集成报告](docs/frontend/phase-10.3-integration-report.md) | REST/WebSocket 兼容、恢复行为与 Phase 10 测试证据 |
@@ -432,6 +435,7 @@ terraform -chdir=deploy/gcp plan -refresh=false
 | [光标设计](docs/frontend/phase-10.5-cursor-design.md) | Cursor 协议、OT 位置转换、生命周期与限流 |
 | [光标验收](docs/frontend/phase-10.5-acceptance-report.md) | 真实浏览器与跨节点 Cursor 验证 |
 | [浏览器兼容性](docs/frontend/phase-10.6-browser-compatibility.md) | Chromium、Firefox、WebKit 与原生 Safari 验证状态 |
+| [浏览器 Transport 兼容性](docs/frontend/phase-11.2-browser-transport-compatibility.md) | WebTransport 选择、WebSocket 回退与双节点浏览器行为 |
 | [Phase 10.7 最终审查](docs/architecture/phase-10.7-final-review.md) | 后端、前端、分布式安全和可读性最终审查 |
 | [Phase 10.7 质量 Gate](docs/operations/phase-10.7-final-quality-gate.md) | 最终测试、安全、依赖、Docker 与 Terraform 验证 |
 | [Go 执行 Runner](docs/operations/go-execution-runner.md) | Phase 10.9 API、隔离边界、资源限制、启动和测试 |
@@ -449,8 +453,7 @@ terraform -chdir=deploy/gcp plan -refresh=false
 - 浏览器编辑器同步线性文本、光标、选区与在线参与者，但不支持富文本元数据。Cursor Presence 属于临时状态，Owner 故障接管后通过在线客户端重建，不做持久化。
 - 浏览器执行只支持单个 Go 源文件和标准库，不提供 Shell、Terminal、多文件 Workspace、第三方 Module 下载或其他语言。标准库冷编译时间也计入 10 秒上限。
 - 本地 Runner 使用宿主机 Docker Daemon，但公网 API 永远不获取 Docker 权限。生产发布需要单独加固的 Runner 主机/服务，当前 Google Cloud Terraform 不包含这部分。
-- Chromium、Firefox 与 Playwright WebKit 已自动化验收；本机安装了原生 Safari 26.5，但因 Safari Remote Automation 未启用而尚未验证，不能把 WebKit 结果视为原生 Safari 结果。
-- 一个 QUIC Connection 当前只承载一个文档和一个 bidirectional Stream；未启用 Datagram 或多文档 Stream Multiplexing。
+- WebTransport 要求 Secure Context、HTTP/3 UDP 可达和可验证的服务端身份。由于浏览器无法稳定地区分 TLS/Origin 策略失败与普通建连失败，自动回退特意限制为“浏览器没有 WebTransport API”；兼容性需要时可由部署配置显式选择 WebSocket。
 - OT 是线性文本 OT-lite，不是完整 CRDT。浏览器编辑会写入 IndexedDB 并按顺序重放，但复杂的客户端多操作 Rebase 仍有限制。
 - MySQL Operation Log 仍为追加写入，尚未实现长期归档策略。
 - 第一版多节点部署采用稳定节点身份，不包含自动扩缩容、自动证书签发或健康 Room 主动迁移。
