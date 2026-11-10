@@ -36,6 +36,15 @@ export interface DocumentPermission {
   role: PermissionRole
 }
 
+export interface RunResult {
+  stdout: string
+  stderr: string
+  exit_code: number
+  duration_ms: number
+  timed_out: boolean
+  output_truncated: boolean
+}
+
 export interface ApiErrorBody {
   type: 'error'
   code: string

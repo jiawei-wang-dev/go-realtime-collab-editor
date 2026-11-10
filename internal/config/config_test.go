@@ -158,6 +158,26 @@ func TestClusterConfigurationRequiresNodeAndTLS(t *testing.T) {
 	}
 }
 
+func TestExecutionConfigurationRequiresPairedSocketAndStrongToken(t *testing.T) {
+	setValidRuntimeEnvironment(t)
+	t.Setenv("RUNNER_SOCKET", "/tmp/collab-runner.sock")
+	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "configured together") {
+		t.Fatalf("unpaired runner configuration error = %v", err)
+	}
+	t.Setenv("RUNNER_TOKEN", "short")
+	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "at least 32") {
+		t.Fatalf("short runner token error = %v", err)
+	}
+	t.Setenv("RUNNER_TOKEN", "01234567890123456789012345678901")
+	loaded, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !loaded.Execution.Enabled() || loaded.Execution.Limits.MaxSourceBytes != 128*1024 || loaded.Execution.UserLimit != 1 {
+		t.Fatalf("execution config = %#v", loaded.Execution)
+	}
+}
+
 func TestLoadClusterConfiguration(t *testing.T) {
 	setValidRuntimeEnvironment(t)
 	t.Setenv("CLUSTER_MODE", "cluster")

@@ -13,6 +13,13 @@ npm run dev
 
 Open `http://127.0.0.1:5173`.
 
+For `.go` documents, owners and writers see a **Run** button. It sends the live
+Monaco buffer (including edits not yet persisted by the collaboration path) to
+the authenticated execution API and renders stdout, stderr, exit code, elapsed
+time, timeout, and truncation state in the output panel. Viewers cannot run
+code. The backend and the separate `cmd/runner` process must be configured as
+described in [Go Execution Runner](../docs/operations/go-execution-runner.md).
+
 Optional production overrides:
 
 - `VITE_API_URL`: public REST origin.
@@ -33,6 +40,7 @@ npm run lint
 npm run typecheck
 npm test
 npm run build
+npx playwright test e2e/execution.spec.ts
 ```
 
 Access tokens stay in JavaScript memory. Rotating refresh tokens use an HttpOnly, SameSite cookie. IndexedDB contains only pending document operations with stable request IDs; it never contains credentials.

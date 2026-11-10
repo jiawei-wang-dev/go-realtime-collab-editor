@@ -21,6 +21,7 @@ import (
 	clusteretcd "github.com/jiawei-wang-dev/go-realtime-collab-editor/internal/cluster/etcd"
 	clusterrpc "github.com/jiawei-wang-dev/go-realtime-collab-editor/internal/cluster/rpc"
 	"github.com/jiawei-wang-dev/go-realtime-collab-editor/internal/config"
+	"github.com/jiawei-wang-dev/go-realtime-collab-editor/internal/execution"
 	"github.com/jiawei-wang-dev/go-realtime-collab-editor/internal/migration"
 	"github.com/jiawei-wang-dev/go-realtime-collab-editor/internal/observability"
 	"github.com/jiawei-wang-dev/go-realtime-collab-editor/internal/storage"
@@ -100,9 +101,13 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	executionRunner, err := openExecutionRunner(runtimeConfig)
+	if err != nil {
+		return err
+	}
 
 	address := ":" + runtimeConfig.Port
-	application := newApplication(runtimeConfig, store, authenticator, authService, sessions, ownership, directory, forwarder, metrics)
+	application := newApplication(runtimeConfig, store, authenticator, authService, sessions, ownership, directory, forwarder, executionRunner, metrics)
 	listener, quicServer, err := listenServers(address, runtimeConfig.REST, application, func() (*quictransport.Server, error) {
 		return listenQUIC(runtimeConfig, application, authenticator, authService, ownership, metrics)
 	})
@@ -289,7 +294,7 @@ func shutdownUnstarted(listener net.Listener, application *api.Server) error {
 	return errors.Join(listenerErr, application.Shutdown(shutdownCtx))
 }
 
-func newApplication(runtimeConfig config.Config, store storage.Store, authenticator authentication.Authenticator, authService *authentication.Service, sessions authentication.SessionStore, ownership cluster.OwnershipService, directory cluster.NodeDirectory, forwarder cluster.PermissionForwarder, metrics *observability.Metrics) *api.Server {
+func newApplication(runtimeConfig config.Config, store storage.Store, authenticator authentication.Authenticator, authService *authentication.Service, sessions authentication.SessionStore, ownership cluster.OwnershipService, directory cluster.NodeDirectory, forwarder cluster.PermissionForwarder, executionRunner execution.Runner, metrics *observability.Metrics) *api.Server {
 	return api.NewServerWithConfig(api.Config{
 		Store:                store,
 		Authenticator:        authenticator,
@@ -311,7 +316,23 @@ func newApplication(runtimeConfig config.Config, store storage.Store, authentica
 		RateLimitWindow:      runtimeConfig.Security.RateLimitWindow,
 		BrowserCookieSecure:  runtimeConfig.Environment == "production",
 		BrowserRefreshTTL:    runtimeConfig.RefreshTTL,
+		ExecutionRunner:      executionRunner,
+		ExecutionLimits:      runtimeConfig.Execution.Limits,
+		ExecutionGlobalLimit: runtimeConfig.Execution.GlobalLimit,
+		ExecutionUserLimit:   runtimeConfig.Execution.UserLimit,
+		ExecutionRateLimit:   runtimeConfig.Execution.RateLimit,
 	})
+}
+
+func openExecutionRunner(runtimeConfig config.Config) (execution.Runner, error) {
+	if !runtimeConfig.Execution.Enabled() {
+		return nil, nil
+	}
+	return execution.NewUnixClient(
+		runtimeConfig.Execution.SocketPath,
+		runtimeConfig.Execution.Token,
+		runtimeConfig.Execution.Limits.Timeout+2*time.Second,
+	)
 }
 
 func listenInternalRPC(runtimeConfig config.Config, handler http.Handler, credentials *clusterrpc.Credentials) (net.Listener, *http.Server, error) {

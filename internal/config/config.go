@@ -15,6 +15,7 @@ import (
 
 	"github.com/jiawei-wang-dev/go-realtime-collab-editor/internal/authentication"
 	"github.com/jiawei-wang-dev/go-realtime-collab-editor/internal/cluster"
+	"github.com/jiawei-wang-dev/go-realtime-collab-editor/internal/execution"
 	mysqlstorage "github.com/jiawei-wang-dev/go-realtime-collab-editor/internal/storage/mysql"
 	"github.com/redis/go-redis/v9"
 )
@@ -45,7 +46,19 @@ type Config struct {
 	QUIC                 QUICConfig
 	Cluster              ClusterConfig
 	Security             SecurityConfig
+	Execution            ExecutionConfig
 }
+
+type ExecutionConfig struct {
+	SocketPath  string
+	Token       string
+	Limits      execution.Limits
+	GlobalLimit int
+	UserLimit   int
+	RateLimit   int
+}
+
+func (config ExecutionConfig) Enabled() bool { return config.SocketPath != "" }
 
 type SecurityConfig struct {
 	AllowedOrigins       []string
@@ -128,6 +141,9 @@ func Load() (Config, error) {
 		return Config{}, err
 	}
 	if err := loadSecurityConfig(&config); err != nil {
+		return Config{}, err
+	}
+	if err := loadExecutionConfig(&config); err != nil {
 		return Config{}, err
 	}
 	if err := loadClusterConfig(&config); err != nil {
@@ -403,6 +419,64 @@ func loadSecurityConfig(config *Config) error {
 	return nil
 }
 
+func loadExecutionConfig(config *Config) error {
+	limits := execution.DefaultLimits()
+	limits.Image = envOrDefault("RUNNER_IMAGE", limits.Image)
+	var err error
+	if limits.Timeout, err = duration("EXECUTION_TIMEOUT", limits.Timeout); err != nil {
+		return err
+	}
+	if limits.MaxSourceBytes, err = positiveInt64("EXECUTION_MAX_SOURCE_BYTES", limits.MaxSourceBytes); err != nil {
+		return err
+	}
+	if limits.MaxOutputBytes, err = positiveInt64("EXECUTION_MAX_OUTPUT_BYTES", limits.MaxOutputBytes); err != nil {
+		return err
+	}
+	if limits.MemoryBytes, err = positiveInt64("EXECUTION_MEMORY_BYTES", limits.MemoryBytes); err != nil {
+		return err
+	}
+	if limits.PIDs, err = positiveInt64("EXECUTION_PIDS", limits.PIDs); err != nil {
+		return err
+	}
+	if limits.WorkspaceBytes, err = positiveInt64("EXECUTION_WORKSPACE_BYTES", limits.WorkspaceBytes); err != nil {
+		return err
+	}
+	if limits.TemporaryBytes, err = positiveInt64("EXECUTION_TEMPORARY_BYTES", limits.TemporaryBytes); err != nil {
+		return err
+	}
+	if value := os.Getenv("EXECUTION_CPUS"); value != "" {
+		limits.CPUs, err = strconv.ParseFloat(value, 64)
+		if err != nil || limits.CPUs <= 0 {
+			return fmt.Errorf("EXECUTION_CPUS must be positive")
+		}
+	}
+	socketPath := os.Getenv("RUNNER_SOCKET")
+	token := os.Getenv("RUNNER_TOKEN")
+	if (socketPath == "") != (token == "") {
+		return fmt.Errorf("RUNNER_SOCKET and RUNNER_TOKEN must be configured together")
+	}
+	if token != "" && len(token) < 32 {
+		return fmt.Errorf("RUNNER_TOKEN must be at least 32 bytes")
+	}
+	globalLimit, err := positiveInt("EXECUTION_GLOBAL_CONCURRENCY", 4)
+	if err != nil {
+		return err
+	}
+	userLimit, err := positiveInt("EXECUTION_USER_CONCURRENCY", 1)
+	if err != nil {
+		return err
+	}
+	rateLimit, err := positiveInt("EXECUTION_RATE_LIMIT", 10)
+	if err != nil {
+		return err
+	}
+	config.Execution = ExecutionConfig{
+		SocketPath: socketPath, Token: token, Limits: limits,
+		GlobalLimit: globalLimit, UserLimit: userLimit, RateLimit: rateLimit,
+	}
+	return nil
+}
+
 func decodeReplayKey(encoded string) ([]byte, error) {
 	key, err := base64.StdEncoding.DecodeString(encoded)
 	if err != nil || len(key) != 32 {
@@ -518,6 +592,18 @@ func positiveInt(name string, fallback int) (int, error) {
 		return fallback, nil
 	}
 	parsed, err := strconv.Atoi(value)
+	if err != nil || parsed <= 0 {
+		return 0, fmt.Errorf("%s must be a positive integer", name)
+	}
+	return parsed, nil
+}
+
+func positiveInt64(name string, fallback int64) (int64, error) {
+	value := os.Getenv(name)
+	if value == "" {
+		return fallback, nil
+	}
+	parsed, err := strconv.ParseInt(value, 10, 64)
 	if err != nil || parsed <= 0 {
 		return 0, fmt.Errorf("%s must be a positive integer", name)
 	}

@@ -12,6 +12,7 @@ import (
 	"github.com/jiawei-wang-dev/go-realtime-collab-editor/internal/authentication"
 	"github.com/jiawei-wang-dev/go-realtime-collab-editor/internal/cluster"
 	"github.com/jiawei-wang-dev/go-realtime-collab-editor/internal/collab"
+	"github.com/jiawei-wang-dev/go-realtime-collab-editor/internal/execution"
 	"github.com/jiawei-wang-dev/go-realtime-collab-editor/internal/permission"
 	"github.com/jiawei-wang-dev/go-realtime-collab-editor/internal/protocol"
 	"github.com/jiawei-wang-dev/go-realtime-collab-editor/internal/room"
@@ -42,6 +43,11 @@ type Config struct {
 	RateLimitWindow       time.Duration
 	BrowserCookieSecure   bool
 	BrowserRefreshTTL     time.Duration
+	ExecutionRunner       execution.Runner
+	ExecutionLimits       execution.Limits
+	ExecutionGlobalLimit  int
+	ExecutionUserLimit    int
+	ExecutionRateLimit    int
 }
 
 type Server struct {
@@ -65,6 +71,9 @@ type Server struct {
 	browserCookieSecure   bool
 	browserRefreshTTL     time.Duration
 	realtime              http.Handler
+	executionRunner       execution.Runner
+	executionLimits       execution.Limits
+	executionGate         *executionGate
 }
 
 func NewServer() *Server {
@@ -94,6 +103,14 @@ func NewServerWithConfig(config Config) *Server {
 		rateLimitWindow: config.RateLimitWindow, allowedOrigins: make(map[string]struct{}, len(config.AllowedOrigins)),
 		browserCookieSecure: config.BrowserCookieSecure,
 		browserRefreshTTL:   config.BrowserRefreshTTL,
+		executionRunner:     config.ExecutionRunner,
+		executionLimits:     config.ExecutionLimits,
+		executionGate: newExecutionGate(
+			config.ExecutionGlobalLimit,
+			config.ExecutionUserLimit,
+			config.ExecutionRateLimit,
+			config.RateLimitWindow,
+		),
 	}
 	for _, origin := range config.AllowedOrigins {
 		server.allowedOrigins[origin] = struct{}{}
@@ -140,6 +157,19 @@ func withDefaults(config Config) Config {
 	if config.RateLimitWindow <= 0 {
 		config.RateLimitWindow = time.Minute
 	}
+	defaults := execution.DefaultLimits()
+	if config.ExecutionLimits.MaxSourceBytes <= 0 || config.ExecutionLimits.Timeout <= 0 {
+		config.ExecutionLimits = defaults
+	}
+	if config.ExecutionGlobalLimit <= 0 {
+		config.ExecutionGlobalLimit = 4
+	}
+	if config.ExecutionUserLimit <= 0 {
+		config.ExecutionUserLimit = 1
+	}
+	if config.ExecutionRateLimit <= 0 {
+		config.ExecutionRateLimit = 10
+	}
 	return config
 }
 
@@ -162,6 +192,7 @@ func (s *Server) routes() http.Handler {
 	mux.HandleFunc("GET /api/documents", s.listDocuments)
 	mux.HandleFunc("GET /api/documents/{docID}", s.getDocument)
 	mux.HandleFunc("DELETE /api/documents/{docID}", s.deleteDocument)
+	mux.HandleFunc("POST /api/v1/documents/{docID}/run", s.runDocument)
 	mux.HandleFunc("GET /api/documents/{docID}/permissions", s.listPermissions)
 	mux.HandleFunc("GET /api/documents/{docID}/permissions/{userID}", s.getPermission)
 	mux.HandleFunc("PUT /api/documents/{docID}/permissions/{userID}", s.updatePermission)
