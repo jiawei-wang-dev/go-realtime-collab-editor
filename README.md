@@ -20,9 +20,9 @@ The main stack is Go, React, TypeScript, Monaco Editor, native QUIC, WebTranspor
 
 ### Dashboard
 
-The authenticated workspace lists accessible documents, versions, roles, search, and document creation without exposing session credentials to browser storage.
+The workspace shows a nested file tree, document search, and controls to create folders and documents.
 
-<img src="docs/assets/screenshots/dashboard.png" width="100%" alt="Collaborative editor document dashboard" />
+<img src="docs/assets/screenshots/workspace-dashboard.png" width="100%" alt="Workspace dashboard with nested folders and files" />
 
 ### Editor & Execution
 
@@ -447,6 +447,7 @@ Do not apply without an approved plan, budget, and rollback procedure.
 | [Observability](docs/operations/phase-8.8-observability.md) | Metrics, tracing, health, and logging conventions |
 | [Load Test](docs/performance/phase-8.9-load-test.md) | Controlled multi-node load and failure results |
 | [Google Cloud Deployment](docs/deployment/phase-9.0-google-cloud-deployment.md) | GCP architecture, cost, deployment, and rollback design |
+| [Single-Node QUIC Demo](docs/deployment/gcp-public-demo.md) | Cost-gated Compute Engine demo with public WebTransport, trusted IP TLS, local backup, and teardown |
 
 ## 11. Current Limitations
 

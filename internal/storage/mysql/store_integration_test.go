@@ -22,6 +22,77 @@ import (
 
 var documentSequence atomic.Uint64
 
+func TestMySQLFolderSharingFollowsFilesAndRevocation(t *testing.T) {
+	store := openIntegrationStore(t)
+	ctx := context.Background()
+	owner, viewer := uniqueDocumentID(), uniqueDocumentID()
+	root := storage.Folder{ID: uniqueDocumentID(), Name: "Project"}
+	child := storage.Folder{ID: uniqueDocumentID(), ParentID: root.ID, Name: "Source"}
+	if err := store.CreateFolder(ctx, root, owner); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CreateFolder(ctx, child, owner); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetFolderPermission(ctx, root.ID, owner, viewer, permission.RoleWrite); err != nil {
+		t.Fatal(err)
+	}
+	docID := uniqueDocumentID()
+	if _, err := store.CreateFolderDocument(ctx, docID, "", owner, child.ID, "main.go"); err != nil {
+		t.Fatal(err)
+	}
+	folders, err := store.ListFolders(ctx, viewer)
+	if err != nil || len(folders) != 2 {
+		t.Fatalf("shared folders = %#v, err = %v", folders, err)
+	}
+	docs, err := store.ListDocuments(ctx, viewer)
+	if err != nil || len(docs) != 1 || docs[0].Role != permission.RoleWrite || docs[0].FolderID != child.ID {
+		t.Fatalf("shared documents = %#v, err = %v", docs, err)
+	}
+	if err := store.SetFolderPermission(ctx, root.ID, viewer, owner, permission.RoleRead); !errors.Is(err, storage.ErrPermissionDenied) {
+		t.Fatalf("writer modifying shares: %v", err)
+	}
+	manager := room.NewManager(store)
+	t.Cleanup(func() { _ = manager.Shutdown(context.Background()) })
+	target, err := manager.Room(docID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := integrationClient(t, target, viewer)
+	if err := store.SetFolderPermission(ctx, root.ID, owner, viewer, permission.RoleRead); err != nil {
+		t.Fatal(err)
+	}
+	if err := target.SubmitEdit(client, "room-downgrade", collab.Operation{
+		Kind: collab.OperationInsert, Text: "blocked",
+	}); err == nil {
+		t.Fatal("room accepted edit after downgrade")
+	}
+	edit := integrationCommit(docID, "after-downgrade", 0, "blocked")
+	edit.Operation.UserID = viewer
+	if err := store.CommitEdit(ctx, edit); !errors.Is(err, storage.ErrPermissionDenied) {
+		t.Fatalf("write after downgrade: %v", err)
+	}
+	changes, err := store.PreviewDocumentMove(ctx, docID, owner, "")
+	if err != nil || len(changes) != 1 || changes[0] != (storage.AccessChange{UserID: viewer, Before: permission.RoleRead}) {
+		t.Fatalf("move preview = %#v, err = %v", changes, err)
+	}
+	if err := store.MoveDocument(ctx, docID, owner, ""); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.GetPermission(ctx, docID, viewer); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("permission after move: %v", err)
+	}
+	if err := store.MoveDocument(ctx, docID, owner, child.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetFolderPermission(ctx, root.ID, owner, viewer, ""); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.GetPermission(ctx, docID, viewer); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("permission after revoke: %v", err)
+	}
+}
+
 func TestMySQLCreateReadAndOwnerPermission(t *testing.T) {
 	store := openIntegrationStore(t)
 	docID := uniqueDocumentID()

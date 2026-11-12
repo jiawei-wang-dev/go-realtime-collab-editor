@@ -7,7 +7,7 @@ interface DocumentState {
   loading: boolean
   error: string
   load: () => Promise<void>
-  create: (id: string) => Promise<void>
+  create: (id: string, folderId?: string) => Promise<string>
   remove: (id: string) => Promise<void>
   clearError: () => void
   reset: () => void
@@ -28,12 +28,13 @@ export const useDocumentStore = create<DocumentState>((set) => ({
     }
   },
 
-  create: async (id) => {
+  create: async (id, folderId) => {
     set({ loading: true, error: '' })
     try {
-      await documentsApi.createDocument(id)
+      const document = await documentsApi.createDocument(id, '', folderId)
       const documents = await documentsApi.listDocuments()
       set({ documents, loading: false })
+      return document.id
     } catch (error) {
       set({ loading: false, error: error instanceof Error ? error.message : 'Unable to create the document.' })
       throw error

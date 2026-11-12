@@ -1,10 +1,13 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { Link, useParams } from 'react-router-dom'
+import { Link, useNavigate, useParams } from 'react-router-dom'
 import { getDocument } from '../api/documents'
 import { runGoDocument } from '../api/execution'
 import { Avatar } from '../components/Avatar'
 import { Brand } from '../components/Brand'
 import { ErrorBanner, LoadingState } from '../components/Feedback'
+import { EditorExplorer } from '../components/EditorExplorer'
+import { DocumentHistory } from '../components/DocumentHistory'
+import { QuickOpen } from '../components/QuickOpen'
 import { Icon } from '../components/Icon'
 import { ShareDialog } from '../components/ShareDialog'
 import { RunConsole } from '../components/RunConsole'
@@ -24,8 +27,11 @@ function languageFor(documentId: string): string {
 
 export function EditorPage() {
   const { documentId = '' } = useParams()
+  const navigate = useNavigate()
   const decodedId = useMemo(() => decodeURIComponent(documentId), [documentId])
   const [shareOpen, setShareOpen] = useState(false)
+  const [historyOpen, setHistoryOpen] = useState(false)
+  const [file, setFile] = useState<{ id: string; name: string }>()
   const [running, setRunning] = useState(false)
   const [runResult, setRunResult] = useState<RunResult | null>(null)
   const [runError, setRunError] = useState('')
@@ -37,6 +43,7 @@ export function EditorPage() {
   const remoteCursorsRef = useRef(new Map<string, CursorState>())
   const selectionListenerRef = useRef<{ dispose: () => void } | null>(null)
   const editorRef = useRef<editor.IStandaloneCodeEditor | null>(null)
+  const switching = useRef(false)
 
   useEffect(() => {
     let cancelled = false
@@ -44,6 +51,7 @@ export function EditorPage() {
     collaboration.beginLoad(decodedId)
     void getDocument(decodedId).then((document) => {
       if (!cancelled) {
+        setFile({ id: decodedId, name: document.name ?? decodedId })
         collaboration.initialize(document.id, document.content, document.version)
         if (!user) return
         const session = new RealtimeSession(decodedId, user.id, {
@@ -58,7 +66,9 @@ export function EditorPage() {
           },
         })
         sessionRef.current = session
-        void session.start().catch((reason: unknown) => collaboration.setError(reason instanceof Error ? reason.message : 'Unable to restore pending edits.'))
+        void session.start().catch((reason: unknown) => {
+          if (!cancelled) collaboration.setError(reason instanceof Error ? reason.message : 'Unable to restore pending edits.')
+        })
       }
     }).catch((reason: unknown) => {
       if (!cancelled) collaboration.setError(reason instanceof Error ? reason.message : 'Unable to open the document.')
@@ -81,8 +91,25 @@ export function EditorPage() {
 
   const connected = collaboration.connection === 'CONNECTED'
   const readOnly = collaboration.role === 'read' || collaboration.role === ''
-  const language = languageFor(decodedId)
+  const fileName = file?.id === decodedId ? file.name : decodedId
+  const language = languageFor(fileName)
   const canRun = language === 'go' && !readOnly && !collaboration.loading
+
+  const openFile = async (id: string) => {
+    if (id === decodedId || switching.current) return
+    switching.current = true
+    try {
+      await sessionRef.current?.flushEdits()
+      setShareOpen(false)
+      setHistoryOpen(false)
+      setOutputOpen(false)
+      navigate(`/documents/${encodeURIComponent(id)}`)
+    } catch (reason) {
+      collaboration.setError(reason instanceof Error ? reason.message : 'Unable to save edits before switching files.')
+    } finally {
+      switching.current = false
+    }
+  }
 
   const runDocument = async () => {
     if (!canRun || running) return
@@ -103,11 +130,11 @@ export function EditorPage() {
   return (
     <div className="editor-page">
       <header className="editor-topbar">
-        <Link to="/" className="editor-brand"><Brand compact /><span className="breadcrumb">Workspace</span><span>/</span><strong>{decodedId}</strong></Link>
+        <Link to="/" className="editor-brand"><Brand compact /><span className="breadcrumb">Workspace</span><span>/</span><strong>{fileName}</strong></Link>
         <div className="editor-actions"><span className={`connection-pill connection-${collaboration.connection.toLowerCase()}`}><span /> {collaboration.connection.replace('_', ' ').toLowerCase()}</span><span className={`sync-pill ${collaboration.synchronized ? 'is-synced' : ''}`}>{collaboration.pendingCount > 0 ? `${collaboration.pendingCount} pending` : collaboration.synchronized ? 'Synced' : 'Syncing'}</span>{language === 'go' && <button className="run-button" onClick={() => { void runDocument() }} disabled={!canRun || running}>{running ? 'Running…' : '▶ Run'}</button>}<button className="secondary-button" onClick={() => setShareOpen(true)} disabled={collaboration.role !== 'owner'}><Icon name="share" /> Share</button><Link to="/settings" className="avatar-link" aria-label="Account settings"><Avatar name={user?.username ?? 'User'} /></Link></div>
       </header>
       <div className="editor-workspace">
-        <aside className="file-panel"><div className="panel-title"><span>EXPLORER</span><Link to="/" title="All documents"><Icon name="files" /></Link></div><button className="file-entry active"><Icon name="code" /><span>{decodedId.split('/').pop()}</span></button><div className="file-panel-meta"><span>Document</span><code>v{collaboration.version}</code></div></aside>
+        <aside className="file-panel"><div className="panel-title"><span>EXPLORER</span><QuickOpen userId={user?.id ?? ''} activeId={decodedId} onOpen={(id) => void openFile(id)} /><Link to="/" title="All documents"><Icon name="files" /></Link></div><EditorExplorer activeId={decodedId} onOpen={(id) => void openFile(id)} /><div className="file-panel-meta"><button type="button" className="ghost-button" onClick={() => setHistoryOpen(true)} disabled={!collaboration.role}>History</button><code>v{collaboration.version}</code></div></aside>
         <main className="monaco-panel"><div className="monaco-editor-region">{collaboration.loading ? <LoadingState label="Opening document…" /> : collaboration.error ? <ErrorBanner message={collaboration.error} /> : <MonacoWorkspace value={collaboration.content} language={language} readOnly={readOnly} onChange={(value) => { void sessionRef.current?.updateContent(value) }} onMount={(editor, monaco) => {
           editorRef.current = editor
           selectionListenerRef.current?.dispose()
@@ -127,7 +154,8 @@ export function EditorPage() {
         <aside className="collaborator-panel"><div className="panel-title"><span>COLLABORATORS</span><Icon name="users" /></div><div className="participant-list">{collaboration.participants.length === 0 ? <p className="panel-empty">No active collaborators yet.</p> : collaboration.participants.map((participant) => <div className="participant" key={participant}><Avatar name={participant} size="sm" /><div><strong>{participant === user?.id ? user.username : participant}</strong><span>{participant === user?.id ? 'You' : 'Online'}</span></div><span className="online-dot" /></div>)}</div><div className="collaboration-info"><span>Access</span><strong>{collaboration.role || '—'}</strong><span>Pending edits</span><strong>{collaboration.pendingCount}</strong></div></aside>
       </div>
       <footer className="editor-statusbar"><div><span className={`status-indicator status-${collaboration.connection.toLowerCase()}`} /> {collaboration.connection.replace('_', ' ').toLowerCase()}{collaboration.transport && <span> · {collaboration.transport}</span>}</div><div><span>Version {collaboration.version}</span><span>{collaboration.pendingCount} pending</span><span>{collaboration.synchronized ? 'Synced' : 'Waiting for sync'}</span><span>{language}</span></div></footer>
-      {shareOpen && <ShareDialog documentId={decodedId} onClose={() => setShareOpen(false)} />}
+      {shareOpen && <ShareDialog documentId={decodedId} name={fileName} onClose={() => setShareOpen(false)} />}
+      {historyOpen && <DocumentHistory key={decodedId} id={decodedId} current={collaboration.content} version={collaboration.version} onClose={() => setHistoryOpen(false)} />}
     </div>
   )
 }

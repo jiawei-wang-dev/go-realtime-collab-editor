@@ -70,6 +70,14 @@ func (s *Store) Close() error { return s.db.Close() }
 func (s *Store) DB() *sql.DB  { return s.db }
 
 func (s *Store) CreateDocument(ctx context.Context, id, content, ownerID string) (_ collab.Document, resultErr error) {
+	return s.createDocument(ctx, id, content, ownerID, "", "")
+}
+
+func (s *Store) CreateFolderDocument(ctx context.Context, id, content, ownerID, folderID, name string) (collab.Document, error) {
+	return s.createDocument(ctx, id, content, ownerID, folderID, name)
+}
+
+func (s *Store) createDocument(ctx context.Context, id, content, ownerID, folderID, name string) (_ collab.Document, resultErr error) {
 	ctx, span := otel.Tracer("collab-editor/mysql").Start(ctx, "mysql.create_document")
 	defer span.End()
 	started := time.Now()
@@ -85,9 +93,15 @@ func (s *Store) CreateDocument(ctx context.Context, id, content, ownerID string)
 	}
 	defer tx.Rollback()
 
+	if folderID != "" {
+		if err := lockOwnedFolder(ctx, tx, folderID, ownerID); err != nil {
+			return collab.Document{}, err
+		}
+	}
 	if _, err = tx.ExecContext(ctx,
-		`INSERT INTO documents (id, owner_id, content, version) VALUES (?, ?, ?, 0)`,
-		id, ownerID, content,
+		`INSERT INTO documents (id, owner_id, content, version, folder_id, display_name)
+		 VALUES (?, ?, ?, 0, NULLIF(?, ''), NULLIF(?, ''))`,
+		id, ownerID, content, folderID, name,
 	); err != nil {
 		if isDuplicate(err) {
 			return collab.Document{}, storage.ErrAlreadyExists
@@ -116,11 +130,23 @@ func (s *Store) ListDocuments(ctx context.Context, userID string) ([]storage.Doc
 	ctx, cancel := s.withTimeout(ctx)
 	defer cancel()
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT d.id, d.version, p.role, d.updated_at
-		FROM documents d
-		JOIN document_permissions p ON p.document_id = d.id
-		WHERE p.user_id = ?
-		ORDER BY d.updated_at DESC, d.id ASC`, userID)
+		WITH RECURSIVE visible_folders AS (
+			SELECT folder_id, IF(role = 'write', 2, 1) AS strength
+			FROM folder_permissions WHERE user_id = ?
+			UNION ALL
+			SELECT f.id, v.strength FROM folders f JOIN visible_folders v ON f.parent_id = v.folder_id
+		), grants AS (
+			SELECT document_id, CASE role WHEN 'owner' THEN 3 WHEN 'write' THEN 2 ELSE 1 END AS strength
+			FROM document_permissions WHERE user_id = ?
+			UNION ALL
+			SELECT d.id, v.strength FROM documents d JOIN visible_folders v ON v.folder_id = d.folder_id
+		), effective AS (
+			SELECT document_id, MAX(strength) AS strength FROM grants GROUP BY document_id
+		)
+		SELECT d.id, d.version, ELT(e.strength, 'read', 'write', 'owner'), d.updated_at,
+			COALESCE(d.folder_id, ''), COALESCE(d.display_name, d.id)
+		FROM documents d JOIN effective e ON e.document_id = d.id
+		ORDER BY d.updated_at DESC, d.id ASC`, userID, userID)
 	if err != nil {
 		return nil, fmt.Errorf("list documents: %w", err)
 	}
@@ -128,7 +154,7 @@ func (s *Store) ListDocuments(ctx context.Context, userID string) ([]storage.Doc
 	result := make([]storage.DocumentSummary, 0)
 	for rows.Next() {
 		var summary storage.DocumentSummary
-		if err := rows.Scan(&summary.ID, &summary.Version, &summary.Role, &summary.UpdatedAt); err != nil {
+		if err := rows.Scan(&summary.ID, &summary.Version, &summary.Role, &summary.UpdatedAt, &summary.FolderID, &summary.Name); err != nil {
 			return nil, fmt.Errorf("scan document summary: %w", err)
 		}
 		result = append(result, summary)
@@ -305,15 +331,13 @@ func (s *Store) GetDocument(ctx context.Context, id string) (collab.Document, er
 func (s *Store) GetPermission(ctx context.Context, docID, userID string) (permission.Role, error) {
 	ctx, cancel := s.withTimeout(ctx)
 	defer cancel()
-	var role permission.Role
-	if err := s.db.QueryRowContext(ctx,
-		`SELECT role FROM document_permissions WHERE document_id = ? AND user_id = ?`,
-		docID, userID,
-	).Scan(&role); err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return "", storage.ErrNotFound
-		}
-		return "", fmt.Errorf("get permission: %w", err)
+	permissions, err := getPermissions(ctx, s.db, docID)
+	if err != nil {
+		return "", err
+	}
+	role, ok := permissions[userID]
+	if !ok {
+		return "", storage.ErrNotFound
 	}
 	return role, nil
 }
@@ -321,7 +345,11 @@ func (s *Store) GetPermission(ctx context.Context, docID, userID string) (permis
 func (s *Store) GetPermissions(ctx context.Context, docID string) (map[string]permission.Role, error) {
 	ctx, cancel := s.withTimeout(ctx)
 	defer cancel()
-	if _, err := s.GetDocument(ctx, docID); err != nil {
+	var exists int
+	if err := s.db.QueryRowContext(ctx, "SELECT 1 FROM documents WHERE id = ?", docID).Scan(&exists); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, storage.ErrNotFound
+		}
 		return nil, err
 	}
 	return getPermissions(ctx, s.db, docID)
@@ -335,7 +363,7 @@ func (s *Store) SetPermission(ctx context.Context, commit storage.PermissionComm
 	if err := storage.ValidateWriteAuthority(commit.Authority); err != nil {
 		return err
 	}
-	if commit.UserID == "" || !commit.Role.Valid() {
+	if commit.UserID == "" || (commit.Role != "" && !commit.Role.Valid()) {
 		return fmt.Errorf("valid target user and role are required")
 	}
 	ctx, cancel := s.withTimeout(ctx)
@@ -365,6 +393,21 @@ func (s *Store) SetPermission(ctx context.Context, commit storage.PermissionComm
 	}
 	if !actorRole.CanChangePermissions() {
 		return storage.ErrPermissionDenied
+	}
+	if commit.Role == "" {
+		var role permission.Role
+		err := tx.QueryRowContext(ctx, "SELECT role FROM document_permissions WHERE document_id = ? AND user_id = ?",
+			commit.DocumentID, commit.UserID).Scan(&role)
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return err
+		}
+		if role == permission.RoleOwner {
+			return storage.ErrPermissionDenied
+		}
+		if _, err := tx.ExecContext(ctx, "DELETE FROM document_permissions WHERE document_id = ? AND user_id = ?", commit.DocumentID, commit.UserID); err != nil {
+			return err
+		}
+		return tx.Commit()
 	}
 	if _, err := tx.ExecContext(ctx, `
 		INSERT INTO document_permissions (document_id, user_id, role)
@@ -411,6 +454,13 @@ func (s *Store) CommitEdit(ctx context.Context, commit storage.EditCommit) (resu
 	}
 	if !currentNode.Valid || currentNode.String != commit.Authority.NodeID || currentToken != commit.Authority.FencingToken {
 		return storage.ErrFenced
+	}
+	roles, err := getPermissions(ctx, tx, commit.Document.ID)
+	if err != nil {
+		return err
+	}
+	if !roles[commit.Operation.UserID].CanWrite() {
+		return storage.ErrPermissionDenied
 	}
 	var duplicate int
 	err = tx.QueryRowContext(ctx,
@@ -678,8 +728,24 @@ func getDocument(ctx context.Context, query queryer, id string) (collab.Document
 }
 
 func getPermissions(ctx context.Context, query queryer, docID string) (map[string]permission.Role, error) {
+	return documentPermissions(ctx, query, docID, false, "")
+}
+
+func documentPermissions(ctx context.Context, query queryer, docID string, overrideFolder bool, folderID string) (map[string]permission.Role, error) {
 	rows, err := query.QueryContext(ctx,
-		`SELECT user_id, role FROM document_permissions WHERE document_id = ?`, docID,
+		`WITH RECURSIVE ancestors AS (
+			SELECT f.id, f.parent_id FROM folders f JOIN documents d
+				ON f.id = IF(?, NULLIF(?, ''), d.folder_id) WHERE d.id = ?
+			UNION ALL
+			SELECT f.id, f.parent_id FROM folders f JOIN ancestors a ON a.parent_id = f.id
+		), grants AS (
+			SELECT user_id, CASE role WHEN 'owner' THEN 3 WHEN 'write' THEN 2 ELSE 1 END AS strength
+			FROM document_permissions WHERE document_id = ?
+			UNION ALL
+			SELECT p.user_id, IF(p.role = 'write', 2, 1)
+			FROM folder_permissions p JOIN ancestors a ON a.id = p.folder_id
+		)
+		SELECT user_id, ELT(MAX(strength), 'read', 'write', 'owner') FROM grants GROUP BY user_id`, overrideFolder, folderID, docID, docID,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("load permissions: %w", err)

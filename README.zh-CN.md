@@ -20,9 +20,9 @@
 
 ### Dashboard
 
-登录后的 Workspace 展示当前可访问文档、Version、Role、搜索与文档创建，不会将 Session 凭据写入浏览器存储。
+工作区展示多级文件树，并提供文档搜索、新建文件夹和新建文档入口。
 
-<img src="docs/assets/screenshots/dashboard.png" width="100%" alt="协作编辑器文档 Dashboard" />
+<img src="docs/assets/screenshots/workspace-dashboard.png" width="100%" alt="展示多级文件夹和文件的工作区首页" />
 
 ### 编辑与执行
 
@@ -447,6 +447,7 @@ terraform -chdir=deploy/gcp plan -refresh=false
 | [可观测性](docs/operations/phase-8.8-observability.md) | Metrics、Tracing、Health 和日志约定 |
 | [压力测试](docs/performance/phase-8.9-load-test.md) | 多节点受控压测与故障注入结果 |
 | [Google Cloud 部署](docs/deployment/phase-9.0-google-cloud-deployment.md) | GCP 架构、成本、部署和回滚设计 |
+| [单节点 QUIC Demo](docs/deployment/gcp-public-demo.md) | 带费用审批 Gate 的 Compute Engine Demo，包含公网 WebTransport、可信 IP TLS、本地备份与销毁流程 |
 
 ## 11. 当前限制
 

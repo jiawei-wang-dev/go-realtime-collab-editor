@@ -16,6 +16,7 @@ export interface AccessTokenResponse {
 
 export interface DocumentRecord {
   id: string
+  name?: string
   content: string
   version: number
 }
@@ -24,9 +25,18 @@ export type PermissionRole = 'owner' | 'write' | 'read'
 
 export interface DocumentSummary {
   id: string
+  folder_id?: string
+  name?: string
   version: number
   role: PermissionRole
   updated_at: string
+}
+
+export interface Folder {
+  id: string
+  parent_id?: string
+  name: string
+  role: PermissionRole
 }
 
 export interface DocumentPermission {

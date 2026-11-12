@@ -86,6 +86,8 @@ type Snapshot struct {
 
 type DocumentSummary struct {
 	ID        string          `json:"id"`
+	FolderID  string          `json:"folder_id,omitempty"`
+	Name      string          `json:"name,omitempty"`
 	Version   uint64          `json:"version"`
 	Role      permission.Role `json:"role"`
 	UpdatedAt time.Time       `json:"updated_at"`

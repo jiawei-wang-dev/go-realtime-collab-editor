@@ -1,8 +1,10 @@
 import type { SVGProps } from 'react'
 
-type IconName = 'code' | 'files' | 'search' | 'plus' | 'settings' | 'logout' | 'share' | 'users' | 'trash' | 'chevron'
+type IconName = 'code' | 'files' | 'folder' | 'search' | 'plus' | 'settings' | 'logout' | 'share' | 'users' | 'trash' | 'chevron' | 'edit'
 
 const paths: Record<IconName, React.ReactNode> = {
+  edit: <><path d="m14 6 4 4M4 20l4-.8L20 7l-4-4L4 15Z"/></>,
+  folder: <path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2Z"/>,
   code: <><path d="m8 9-3 3 3 3"/><path d="m16 9 3 3-3 3"/><path d="m14 5-4 14"/></>,
   files: <><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8Z"/><path d="M14 2v6h6"/></>,
   search: <><circle cx="11" cy="11" r="7"/><path d="m20 20-4-4"/></>,

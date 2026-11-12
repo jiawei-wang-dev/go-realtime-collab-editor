@@ -33,7 +33,7 @@ async function register(page: Page, username: string): Promise<void> {
   await page.getByLabel('Password').fill('CorrectHorseBattery1!')
   await page.locator('form').getByRole('button', { name: 'Create account', exact: true }).click()
   await expect(page).toHaveURL(/\/$/)
-  await expect(page.getByRole('heading', { name: new RegExp(username) })).toBeVisible()
+  await expect(page.getByRole('heading', { name: 'Workspace', exact: true })).toBeVisible()
 }
 
 async function focusEditor(page: Page): Promise<void> {
@@ -116,6 +116,10 @@ test('two real browser contexts collaborate, recover pending edits, refresh, and
   const documentId = `phase104-${suffix}.go`
   const contextA = await browser.newContext({ viewport: { width: 1440, height: 900 } })
   const contextB = await browser.newContext({ viewport: { width: 1440, height: 900 } })
+  if (process.env.E2E_DISABLE_WEBTRANSPORT === 'true') {
+    const disableWebTransport = () => Object.defineProperty(globalThis, 'WebTransport', { configurable: true, value: undefined })
+    await Promise.all([contextA.addInitScript(disableWebTransport), contextB.addInitScript(disableWebTransport)])
+  }
   const pageA = await contextA.newPage()
   const pageB = await contextB.newPage()
   const diagnosticsA = collectDiagnostics(pageA)
@@ -241,7 +245,8 @@ test('two real browser contexts collaborate, recover pending edits, refresh, and
     // Refresh proves cookie bootstrap restores the in-memory access token.
     await pageA.reload()
     await expect(pageA.locator('.connection-connected')).toBeVisible({ timeout: 30_000 })
-    expect(await pageA.evaluate(() => Object.keys(localStorage))).toEqual([])
+    const recentKeys = await pageA.evaluate(() => Object.keys(localStorage))
+    expect(recentKeys.every((key) => key.startsWith('workspace-recent:'))).toBe(true)
     expect(await pageA.evaluate(() => Object.keys(sessionStorage))).toEqual([])
 
     // Downgrade the writer and verify the live editor becomes read-only.

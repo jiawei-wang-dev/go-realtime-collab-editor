@@ -40,6 +40,7 @@ export class RealtimeSession {
   private lastCursorSentAt = 0
   private currentCursor: Pick<CursorState, 'anchor' | 'head'> | null = null
   private localChangesQueued = 0
+  private localSaveError: Error | undefined
 
   constructor(
     private readonly documentId: string,
@@ -55,6 +56,7 @@ export class RealtimeSession {
       loadPending(this.userId, this.documentId),
       loadRecoveryState(this.userId, this.documentId),
     ])
+    if (this.stopped) return
     this.pending = pending
     const state = useCollaborationStore.getState()
     this.confirmedContent = recoveryState?.content ?? state.content
@@ -101,15 +103,28 @@ export class RealtimeSession {
     this.localChangesQueued += 1
     const update = this.tasks
       .catch(() => undefined)
-      .then(() => this.persistLocalChange(next))
+      .then(async () => {
+        await this.persistLocalChange(next)
+        this.localSaveError = undefined
+      })
       .finally(() => {
         this.localChangesQueued -= 1
         if (this.localChangesQueued === 0) this.scheduleCursor()
       })
     this.tasks = update.catch((error: unknown) => {
-      useCollaborationStore.getState().setError(error instanceof Error ? error.message : 'Unable to save the local edit.')
+      this.localSaveError = error instanceof Error ? error : new Error('Unable to save the local edit.')
+      useCollaborationStore.getState().setError(this.localSaveError.message)
     })
     return update
+  }
+
+  async flushEdits(): Promise<void> {
+    let queued: Promise<void>
+    do {
+      queued = this.tasks
+      await queued
+    } while (queued !== this.tasks)
+    if (this.localSaveError) throw this.localSaveError
   }
 
   updateCursor(anchor: number, head: number): void {
@@ -176,7 +191,9 @@ export class RealtimeSession {
 
   private handleMessage(message: RealtimeMessage, generation: number): void {
     if (generation !== this.connectionGeneration) return
-    this.tasks = this.tasks.catch(() => undefined).then(() => this.receive(message)).catch((error: unknown) => {
+    this.tasks = this.tasks.catch(() => undefined).then(async () => {
+      if (!this.stopped && generation === this.connectionGeneration) await this.receive(message)
+    }).catch((error: unknown) => {
       useCollaborationStore.getState().setError(error instanceof Error ? error.message : 'Realtime recovery failed.')
       this.disconnectAndReconnect('recovery failed')
     })
@@ -282,7 +299,7 @@ export class RealtimeSession {
         break
       case 'error':
         if (message.code === 'RESYNC_REQUIRED') { this.send({ type: 'resume', doc_id: this.documentId, last_version: 0 }); return }
-        if (message.code === 'PERMISSION_DENIED' && !this.authRefreshAttempted) {
+        if (message.code === 'PERMISSION_DENIED' && state.connection !== 'SYNCING' && state.connection !== 'CONNECTED' && !this.authRefreshAttempted) {
           this.authRefreshAttempted = true
           void useAuthStore.getState().refresh()
             .then(() => this.disconnectAndReconnect('token refreshed'))
@@ -292,7 +309,9 @@ export class RealtimeSession {
             })
           return
         }
-        state.setError(message.message ?? 'Realtime collaboration failed.')
+        state.setError(message.code === 'PERMISSION_DENIED' && state.connection === 'SYNCING'
+          ? 'You no longer have access to this file.'
+          : message.message ?? 'Realtime collaboration failed.')
         if (message.code === 'PERMISSION_DENIED') this.stop()
         break
     }

@@ -440,7 +440,12 @@ func listenQUIC(runtimeConfig config.Config, application *api.Server, authentica
 	return quictransport.Listen(quicConfig, application.RoomManager(), authenticator)
 }
 
-func listenWebTransport(runtimeConfig config.Config, application *api.Server, authenticator authentication.Authenticator, authService *authentication.Service, ownership cluster.OwnerResolver, directory cluster.NodeDirectory) (*webtransporttransport.Server, error) {
+type webTransportLifecycle interface {
+	quicLifecycle
+	Addr() net.Addr
+}
+
+func listenWebTransport(runtimeConfig config.Config, application *api.Server, authenticator authentication.Authenticator, authService *authentication.Service, ownership cluster.OwnerResolver, directory cluster.NodeDirectory) (webTransportLifecycle, error) {
 	if !runtimeConfig.WebTransport.Enabled {
 		return nil, nil
 	}
@@ -456,13 +461,17 @@ func listenWebTransport(runtimeConfig config.Config, application *api.Server, au
 	if authService != nil {
 		registry = authService.Registry()
 	}
-	return webtransporttransport.Listen(webtransporttransport.Config{
+	server, err := webtransporttransport.Listen(webtransporttransport.Config{
 		Address: runtimeConfig.WebTransport.Address, TLSConfig: tlsConfig,
 		AllowedOrigins: runtimeConfig.Security.AllowedOrigins,
 		StreamTimeout:  runtimeConfig.WebTransport.StreamTimeout, IdleTimeout: runtimeConfig.WebTransport.IdleTimeout,
 		MaxMessageSize: uint32(runtimeConfig.WebTransport.MaxMessageSize),
 		Session:        browsertransportConfig(runtimeConfig, application, authenticator, registry, ownership, directory),
 	})
+	if err != nil {
+		return nil, err
+	}
+	return server, nil
 }
 
 func browsertransportConfig(runtimeConfig config.Config, application *api.Server, authenticator authentication.Authenticator, registry *authentication.ConnectionRegistry, ownership cluster.OwnerResolver, directory cluster.NodeDirectory) browsertransport.Config {

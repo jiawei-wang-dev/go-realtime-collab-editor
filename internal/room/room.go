@@ -88,6 +88,8 @@ func newRoom(
 func (r *Room) Run() {
 	idle := time.NewTimer(r.idleTimeout)
 	defer idle.Stop()
+	permissions := time.NewTicker(2 * time.Second)
+	defer permissions.Stop()
 	defer close(r.done)
 	// Done is the externally visible reclamation barrier. Because deferred calls
 	// run in LIFO order, register the Manager callback after close(done) so the
@@ -108,6 +110,14 @@ func (r *Room) Run() {
 				r.cancel()
 				return
 			}
+		case <-permissions.C:
+			if len(r.clients) > 0 {
+				if !r.refreshPermissions() {
+					r.cancel()
+					return
+				}
+				resetIdleTimer(idle, r.idleTimeout, len(r.clients) == 0)
+			}
 		case roomEvent := <-r.events:
 			if r.ctx.Err() != nil {
 				r.rejectClosedEvent(roomEvent)
@@ -120,6 +130,14 @@ func (r *Room) Run() {
 }
 
 func (r *Room) handle(roomEvent event) {
+	switch roomEvent.(type) {
+	case joinEvent, resumeEvent, editEvent, cursorEvent, permissionChangedEvent, permissionEvent, readDocumentEvent:
+		if !r.refreshPermissions() {
+			r.rejectClosedEvent(roomEvent)
+			r.cancel()
+			return
+		}
+	}
 	switch current := roomEvent.(type) {
 	case joinEvent:
 		r.handleJoin(current)
@@ -144,6 +162,28 @@ func (r *Room) handle(roomEvent event) {
 	case readDocumentEvent:
 		r.handleReadDocument(current)
 	}
+}
+
+func (r *Room) refreshPermissions() bool {
+	ctx, cancel := r.storageContext(r.ctx)
+	defer cancel()
+	current, err := r.storage.GetPermissions(ctx, r.docID)
+	if err != nil {
+		return false
+	}
+	previous := r.permissions
+	r.permissions = current
+	for client := range r.clients {
+		role := current[client.Identity()]
+		if !role.CanRead() {
+			r.disconnect(client, &CodedError{Code: protocol.CodePermissionDenied, Message: "read permission revoked"})
+		} else if previous[client.Identity()] != role && !client.TrySend(protocol.Message{
+			Type: protocol.TypePermissionChanged, DocID: r.docID, Role: role,
+		}) {
+			r.disconnect(client, ErrSlowClient)
+		}
+	}
+	return true
 }
 
 func (r *Room) Join(client transport.Client) error {
@@ -598,6 +638,11 @@ func (r *Room) handleEdit(event editEvent) {
 
 	r.document = nextDocument
 	r.history = append(r.history, applied)
+	if !r.refreshPermissions() {
+		event.reply <- ErrRoomClosed
+		r.cancel()
+		return
+	}
 	r.broadcast(protocol.Message{Type: protocol.TypeEditApplied, RequestID: event.requestID, DocID: r.docID, Version: r.document.Version, Operation: &applied.Operation})
 	r.transformStoredCursors(applied.Operation)
 	r.maybeSaveSnapshot()
@@ -806,6 +851,8 @@ func (r *Room) rejectStorageEdit(event editEvent, cause error) {
 		coded = &CodedError{Code: protocol.CodeDuplicateRequest, Message: "request_id has already been applied"}
 	case errors.Is(cause, storage.ErrVersionConflict):
 		coded = &CodedError{Code: protocol.CodeVersionConflict, Message: "stored document version changed"}
+	case errors.Is(cause, storage.ErrPermissionDenied):
+		coded = &CodedError{Code: protocol.CodePermissionDenied, Message: "write permission required"}
 	default:
 		coded = &CodedError{Code: protocol.CodeInternalError, Message: "could not persist edit"}
 	}
@@ -817,7 +864,7 @@ func (r *Room) handlePermissionChanged(event permissionChangedEvent) {
 		event.reply <- &CodedError{Code: protocol.CodePermissionDenied, Message: "owner permission required"}
 		return
 	}
-	if event.userID == "" || !event.role.Valid() {
+	if event.userID == "" || (event.role != "" && !event.role.Valid()) {
 		event.reply <- &CodedError{Code: protocol.CodeBadMessage, Message: "valid target user and role are required"}
 		return
 	}
@@ -846,11 +893,10 @@ func (r *Room) handlePermissionChanged(event permissionChangedEvent) {
 		return
 	}
 
-	r.permissions[event.userID] = event.role
-	for client := range r.clients {
-		if client.Identity() == event.userID && !client.TrySend(protocol.Message{Type: protocol.TypePermissionChanged, DocID: r.docID, Role: event.role}) {
-			r.disconnect(client, ErrSlowClient)
-		}
+	if !r.refreshPermissions() {
+		event.reply <- ErrRoomClosed
+		r.cancel()
+		return
 	}
 	event.reply <- nil
 }

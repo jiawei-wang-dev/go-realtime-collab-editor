@@ -189,13 +189,28 @@ func (s *Server) routes() http.Handler {
 		mux.Handle("GET /api/realtime", s.realtime)
 	}
 	mux.HandleFunc("POST /api/documents", s.createDocument)
+	mux.HandleFunc("GET /api/folders", s.listFolders)
+	mux.HandleFunc("POST /api/folders", s.createFolder)
+	mux.HandleFunc("PUT /api/folders/{folderID}/name", s.renameWorkspaceItem)
+	mux.HandleFunc("DELETE /api/folders/{folderID}", s.manageFolder)
+	mux.HandleFunc("GET /api/folders/{folderID}/parent", s.manageFolder)
+	mux.HandleFunc("PUT /api/folders/{folderID}/parent", s.manageFolder)
+	mux.HandleFunc("GET /api/folders/{folderID}/permissions", s.listFolderAccess)
+	mux.HandleFunc("PUT /api/folders/{folderID}/permissions/{userID}", s.updateFolderPermission)
+	mux.HandleFunc("DELETE /api/folders/{folderID}/permissions/{userID}", s.updateFolderPermission)
 	mux.HandleFunc("GET /api/documents", s.listDocuments)
 	mux.HandleFunc("GET /api/documents/{docID}", s.getDocument)
 	mux.HandleFunc("DELETE /api/documents/{docID}", s.deleteDocument)
+	mux.HandleFunc("PUT /api/documents/{docID}/folder", s.moveDocument)
+	mux.HandleFunc("PUT /api/documents/{docID}/name", s.renameWorkspaceItem)
+	mux.HandleFunc("GET /api/documents/{docID}/folder", s.moveDocument)
 	mux.HandleFunc("POST /api/v1/documents/{docID}/run", s.runDocument)
 	mux.HandleFunc("GET /api/documents/{docID}/permissions", s.listPermissions)
+	mux.HandleFunc("GET /api/documents/{docID}/access", s.listDocumentAccess)
+	mux.HandleFunc("GET /api/documents/{docID}/history", s.documentHistory)
 	mux.HandleFunc("GET /api/documents/{docID}/permissions/{userID}", s.getPermission)
 	mux.HandleFunc("PUT /api/documents/{docID}/permissions/{userID}", s.updatePermission)
+	mux.HandleFunc("DELETE /api/documents/{docID}/permissions/{userID}", s.updatePermission)
 	if s.authService != nil {
 		mux.HandleFunc("GET /api/users/lookup", s.lookupUser)
 	}
@@ -325,9 +340,10 @@ func (s *Server) RoomManager() *room.Manager { return s.manager }
 func (s *Server) InternalHandler() http.Handler { return s.internal }
 
 type createDocumentRequest struct {
-	ID      string `json:"id"`
-	Content string `json:"content"`
-	OwnerID string `json:"owner_id,omitempty"`
+	ID       string `json:"id"`
+	Content  string `json:"content"`
+	OwnerID  string `json:"owner_id,omitempty"`
+	FolderID string `json:"folder_id,omitempty"`
 }
 
 func (s *Server) createDocument(writer http.ResponseWriter, request *http.Request) {
@@ -344,8 +360,27 @@ func (s *Server) createDocument(writer http.ResponseWriter, request *http.Reques
 		writeError(writer, http.StatusBadRequest, protocol.CodeBadMessage, "document id is required")
 		return
 	}
-	document, err := s.store.CreateDocument(request.Context(), body.ID, body.Content, principal.UserID)
+	var document collab.Document
+	var err error
+	if body.FolderID != "" {
+		folders, supported := s.store.(storage.FolderStore)
+		if !supported {
+			writeError(writer, http.StatusServiceUnavailable, protocol.CodeServiceUnavailable, "folders require MySQL")
+			return
+		}
+		if !validWorkspaceName(body.ID) {
+			writeError(writer, http.StatusBadRequest, protocol.CodeBadMessage, "invalid file name")
+			return
+		}
+		document, err = folders.CreateFolderDocument(request.Context(), workspaceID()+"/"+body.ID, body.Content, principal.UserID, body.FolderID, body.ID)
+	} else {
+		document, err = s.store.CreateDocument(request.Context(), body.ID, body.Content, principal.UserID)
+	}
 	if err != nil {
+		if errors.Is(err, storage.ErrPermissionDenied) {
+			writeFolderError(writer, err)
+			return
+		}
 		if errors.Is(err, storage.ErrAlreadyExists) {
 			writeError(writer, http.StatusConflict, protocol.CodeBadMessage, "document already exists")
 			return
@@ -378,7 +413,7 @@ func (s *Server) getDocument(writer http.ResponseWriter, request *http.Request) 
 				s.writeForwardError(writer, err)
 				return
 			}
-			writeJSON(writer, http.StatusOK, document)
+			s.writeDocument(writer, request, document)
 			return
 		}
 	}
@@ -391,7 +426,23 @@ func (s *Server) getDocument(writer http.ResponseWriter, request *http.Request) 
 		writeError(writer, http.StatusServiceUnavailable, protocol.CodeServiceUnavailable, "document owner is unavailable")
 		return
 	}
-	writeJSON(writer, http.StatusOK, document)
+	s.writeDocument(writer, request, document)
+}
+
+func (s *Server) writeDocument(w http.ResponseWriter, r *http.Request, document collab.Document) {
+	response := struct {
+		collab.Document
+		Name string `json:"name,omitempty"`
+	}{Document: document}
+	if store, ok := s.store.(storage.FolderStore); ok {
+		name, err := store.DocumentName(r.Context(), document.ID)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, protocol.CodeInternalError, "could not read file name")
+			return
+		}
+		response.Name = name
+	}
+	writeJSON(w, http.StatusOK, response)
 }
 
 func (s *Server) readLocalDocument(ctx context.Context, userID, documentID string) (collab.Document, error) {
@@ -475,9 +526,15 @@ func (s *Server) updatePermission(writer http.ResponseWriter, request *http.Requ
 	}
 
 	var body updatePermissionRequest
-	if err := decodeJSON(request, &body); err != nil {
-		writeError(writer, http.StatusBadRequest, protocol.CodeBadMessage, err.Error())
-		return
+	if request.Method != http.MethodDelete {
+		if err := decodeJSON(request, &body); err != nil {
+			writeError(writer, http.StatusBadRequest, protocol.CodeBadMessage, err.Error())
+			return
+		}
+		if !body.Role.Valid() {
+			writeError(writer, http.StatusBadRequest, protocol.CodeBadMessage, "valid role required")
+			return
+		}
 	}
 
 	docID := request.PathValue("docID")

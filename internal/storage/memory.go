@@ -217,7 +217,7 @@ func (m *Memory) SetPermission(ctx context.Context, commit PermissionCommit) err
 	if err := ValidateWriteAuthority(commit.Authority); err != nil {
 		return err
 	}
-	if commit.UserID == "" || !commit.Role.Valid() {
+	if commit.UserID == "" || (commit.Role != "" && !commit.Role.Valid()) {
 		return fmt.Errorf("valid target user and role are required")
 	}
 	m.mu.Lock()
@@ -231,7 +231,14 @@ func (m *Memory) SetPermission(ctx context.Context, commit PermissionCommit) err
 	if !m.permissions[commit.DocumentID][commit.ActorID].CanChangePermissions() {
 		return ErrPermissionDenied
 	}
-	m.permissions[commit.DocumentID][commit.UserID] = commit.Role
+	if commit.Role == "" {
+		if m.permissions[commit.DocumentID][commit.UserID] == permission.RoleOwner {
+			return ErrPermissionDenied
+		}
+		delete(m.permissions[commit.DocumentID], commit.UserID)
+	} else {
+		m.permissions[commit.DocumentID][commit.UserID] = commit.Role
+	}
 	return nil
 }
 
